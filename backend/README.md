@@ -1,5 +1,35 @@
 # Plant search
 
+## Plant details
+
+`GET /functions/v1/plant-details?plantId=6` returns one JSON object containing all
+columns of the plant record, plus `common_names` (sorted strings) and `county_fips`
+(sorted integers). Plants without linked records have empty arrays; nullable plant
+fields remain null. An unknown ID returns 404 with `{"error":"Plant not found"}`.
+Only `plantId` is accepted, exactly once, as a positive 32-bit integer.
+
+```js
+const response = await fetch(`${supabaseUrl}/functions/v1/plant-details?plantId=6`, {
+  headers: { apikey: publishableKey }
+});
+if (!response.ok) throw new Error((await response.json()).error ?? 'Plant lookup failed');
+const plant = await response.json();
+```
+
+For hosted deployment, run `202610240007_plant_details.sql` in the SQL Editor and
+deploy the `plant-details` directory (`index.ts`, `handler.ts`, `input.ts`). Keep
+JWT verification off. No user login is needed, and anonymous table access is not
+granted. The RPC is read-only SECURITY DEFINER with an empty search path. Like
+the other endpoints, this function has a best-effort per-runtime throttle of 120
+requests/minute/forwarded IP, with bounded counters, and short public response
+caching. Direct RPC requests bypass the Edge throttle. All current and future
+`plants` columns are included in the public response; keep private fields elsewhere.
+
+```sh
+npx supabase migration up --local
+npx supabase functions serve plant-details
+```
+
 ## County lookup
 
 `POST /functions/v1/plant-counties` accepts a JSON body:

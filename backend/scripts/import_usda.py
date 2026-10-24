@@ -1165,6 +1165,7 @@ def stream_online_import(
     count = 0
     success = 0
     skipped = 0
+    last_milestone_pct = 0
 
     try:
         def task_fn(item: Tuple[str, str, str]) -> Tuple[str, Optional[PlantRecord]]:
@@ -1236,8 +1237,19 @@ def stream_online_import(
                         progress_log.write(f"{sym}\n")
                         progress_log.flush()
 
-                    if verbose and (count % 25 == 0 or count == total):
-                        print(f"[{count}/{total}] {success} plants imported, {skipped} non-plants/varieties skipped.")
+                    pct = (count / total) * 100
+                    current_milestone = int(pct // 10) * 10
+                    if current_milestone > last_milestone_pct:
+                        last_milestone_pct = current_milestone
+                        print(
+                            f"\n>>> PROGRESS MILESTONE: {current_milestone}% COMPLETE ({count}/{total}) | {success} plants live in DB, {skipped} skipped <<<\n",
+                            flush=True,
+                        )
+                    elif verbose and (count % 25 == 0 or count == total):
+                        print(
+                            f"[{pct:5.1f}%] [{count}/{total}] {success} plants live in DB, {skipped} non-plants/varieties skipped.",
+                            flush=True,
+                        )
 
     finally:
         if sql_file:
