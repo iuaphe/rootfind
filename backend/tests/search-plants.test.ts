@@ -13,7 +13,7 @@ test('allows browsing without a name and rejects invalid or repeated parameters'
   assert.deepEqual(parseQuery(new URLSearchParams('search=+++')), { search: '' });
   for (const query of [
     'search=a&search=b', 'search=oak&isWoody=yes',
-    'search=oak&page=1', 'search=oak&pageSize=10', 'toString=x', '__proto__=x',
+    'page=0', 'page=1001', 'pageSize=101', 'pageSize=1.5', 'page=1&page=2', 'toString=x', '__proto__=x',
     `search=${'a'.repeat(201)}`,
   ]) assert.throws(() => parseQuery(new URLSearchParams(query)), undefined, query);
 });
@@ -25,18 +25,23 @@ test('parses multiple enum selections, explicit booleans, and measurement interv
     minHeight: '0', maxHeight: '32767', minWidth: '10', maxWidth: '20',
   })), {
     search: 'oak', lifeCycle: ['annual', 'perennial'], foliage: ['deciduous'], sun: ['full sun', 'part shade'],
-    water: ['med', 'low'], isWoody: true, isTree: false, edible: true, thorns: false,
+    water: ['medium', 'low'], isWoody: true, isTree: false, edible: true, thorns: false,
     minHeight: 0, maxHeight: 32767, minWidth: 10, maxWidth: 20,
   });
 });
 
 test('rejects invalid enum options, measurements, reversed ranges, and duplicates', () => {
   for (const query of [
-    'lifeCycle=', 'lifeCycle=annual,unknown', 'lifeCycle=Annual', 'foliage=annual', 'sun=low', 'water=medium',
+    'lifeCycle=', 'lifeCycle=annual,unknown', 'lifeCycle=Annual', 'foliage=annual', 'sun=low', 'water=bog',
     'minHeight=-1', 'maxHeight=32768', 'minWidth=1.5', 'maxWidth=1e2', 'minHeight=01',
     'minHeight=20&maxHeight=10', 'minWidth=20&maxWidth=10', 'water=low&water=high',
     'edible=null', 'thorns=1', 'minHeight=1&minHeight=2',
   ]) assert.throws(() => parseQuery(new URLSearchParams(query)), undefined, query);
+});
+
+test('parses bounded pagination and normalizes old and new medium water spellings', () => {
+  assert.deepEqual(parseQuery(new URLSearchParams('page=2&pageSize=100&water=med,medium,low')),
+    { page: 2, pageSize: 100, water: ['medium', 'low'] });
 });
 
 test('search punctuation stays literal data', () => {

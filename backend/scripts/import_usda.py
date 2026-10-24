@@ -40,13 +40,16 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import hashlib
 import io
 import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -330,6 +333,13 @@ class PlantMetadataResolver:
                     pass
 
         if cached_profile is not None:
+            if cached_profile.get('HasCharacteristics') and cached_chars is None and not self.offline:
+                master_id = cached_profile.get('Id')
+                if master_id:
+                    cached_chars = self._fetch_json(f'{USDA_API_BASE}/PlantCharacteristics/{master_id}')
+                    if cached_chars is not None:
+                        with open(char_file, 'w', encoding='utf-8') as f:
+                            json.dump(cached_chars, f)
             return cached_profile, cached_chars
 
         if self.offline:
@@ -905,7 +915,7 @@ def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
 
     try:
         proc = subprocess.run(
-            ["psql", db_url],
+            ["psql", "--set", "ON_ERROR_STOP=1", "--dbname", db_url],
             input=sql_content,
             text=True,
             capture_output=True,
@@ -948,7 +958,11 @@ def upsert_plant_to_supabase(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
+            if not 200 <= resp.status < 300:
+                return False
+            result = json.loads(resp.read().decode('utf-8'))
+            # Both the single-row RPC and the current Edge Function return the ID.
+            return isinstance(result, int) and not isinstance(result, bool) and result > 0
     except urllib.error.HTTPError as e:
         err_msg = e.read().decode("utf-8", errors="replace")
         sys.stderr.write(f"Supabase upsert HTTP {e.code} for {record.genus} {record.species}: {err_msg}\n")
@@ -1061,6 +1075,10 @@ def fetch_accepted_checklist(
     return taxa
 
 
+class DeliberateSkip(Exception):
+    """A fetched taxon is intentionally excluded, not a failed request."""
+
+
 def process_plant_online_in_memory(
     symbol: str,
     resolver: PlantMetadataResolver,
@@ -1076,35 +1094,46 @@ def process_plant_online_in_memory(
 
     profile, chars = resolver.get_plant_data(symbol)
     if not profile or not isinstance(profile, dict):
-        return None
+        raise RuntimeError('Profile unavailable; retry required')
 
     # Check plant kingdom and infraspecific rank
     if not is_plant_taxon(profile):
-        return None
+        raise DeliberateSkip('Excluded non-plant taxon')
 
     rank = profile.get("Rank", "")
     sci_name = profile.get("ScientificName", "")
     if rank and rank.lower() in ("variety", "subspecies", "subtaxa", "form"):
-        return None
+        raise DeliberateSkip(f'Excluded taxonomic rank: {rank}')
     if is_variety_or_subspecies(sci_name):
-        return None
+        raise DeliberateSkip('Excluded variety, subspecies, or form')
+
+    if profile.get('HasCharacteristics') and chars is None:
+        raise RuntimeError('Characteristics unavailable; retry required')
 
     master_id = profile.get("Id")
     if not master_id:
-        return None
+        raise RuntimeError('Profile has no master ID; retry required')
 
     # Download distribution CSV directly into memory
     csv_text = download_distribution_csv_in_memory(symbol, master_id)
     if not csv_text:
-        counties = []
-        direct_attrs = {}
-    else:
-        _, counties, direct_attrs = parse_csv_content(csv_text)
-        del csv_text  # Free memory immediately!
+        raise RuntimeError('Distribution CSV unavailable; retry required')
+    header_rows = csv_text.splitlines()
+    if header_rows[0].strip().strip('"').lower() == 'distribution data':
+        header_rows = header_rows[1:]
+    header = next(csv.reader(header_rows), [])
+    normalized_header = {re.sub(r'[_\s-]+', '', column.lower()) for column in header}
+    if not normalized_header.intersection({'symbol', 'scientificname'}) or not normalized_header.intersection(
+        {'country', 'state', 'county', 'countyfip', 'countyfips'}
+    ):
+        raise RuntimeError('Unrecognized distribution CSV; retry required')
+    _, counties, direct_attrs = parse_csv_content(csv_text)
+    del csv_text  # Free memory immediately!
 
     record = map_plant_attributes(symbol, profile, chars, direct_attrs)
-    if record:
-        record.counties.update(counties)
+    if record is None:
+        raise RuntimeError('Plant identity could not be mapped; retry required')
+    record.counties.update(counties)
 
     return record
 
@@ -1121,20 +1150,72 @@ def stream_online_import(
     supabase_url: Optional[str] = None,
     supabase_key: Optional[str] = None,
     use_edge_function: bool = True,
-) -> None:
+) -> Dict[str, int]:
     """
     Streams online data plant-by-plant in memory, writes SQL / inserts into DB,
     and discards data immediately. Zero CSV files stored on disk!
     """
+    if bool(supabase_url) != bool(supabase_key):
+        raise ValueError('Both Supabase URL and key are required for live writes')
+    destinations = []
+    if sql_out_path:
+        destinations.append('sql:' + str(sql_out_path.resolve()))
+    if db_url:
+        destinations.append('db:' + db_url)
+    if supabase_url:
+        destinations.append('supabase:' + supabase_url.rstrip('/'))
+    if not destinations:
+        raise ValueError('Provide a SQL output file or a database destination')
+    # Do not store database passwords in the progress file. A checkpoint applies
+    # only to the same set of destinations, not to another project or output file.
+    context = hashlib.sha256(json.dumps(sorted(destinations)).encode()).hexdigest()
     completed_symbols: Set[str] = set()
+    confirmed_sql_end = 0
     if progress_file_path and progress_file_path.exists():
-        try:
-            with open(progress_file_path, "r", encoding="utf-8") as f:
-                completed_symbols = {line.strip().upper() for line in f if line.strip()}
-            if verbose:
-                print(f"Resuming: {len(completed_symbols)} plants already processed previously.")
-        except Exception:
-            pass
+        unverified = 0
+        sql_size = sql_out_path.stat().st_size if sql_out_path and sql_out_path.exists() else 0
+        with open(progress_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    unverified += 1
+                    continue
+                if not isinstance(event, dict) or event.get('version') != 2 or event.get('context') != context:
+                    continue
+                status = event.get('status')
+                if status == 'skipped' and event.get('reason'):
+                    completed_symbols.add(event['symbol'])
+                elif status in {'written', 'exported'}:
+                    if sql_out_path:
+                        sql_end = event.get('sql_end')
+                        if type(sql_end) is not int or not 0 < sql_end <= sql_size:
+                            continue
+                        confirmed_sql_end = max(confirmed_sql_end, sql_end)
+                    completed_symbols.add(event['symbol'])
+        if unverified:
+            sys.stderr.write(f'Ignoring {unverified} unverified legacy/partial progress entries; those symbols will be retried.\n')
+        if verbose:
+            print(f'Resuming: {len(completed_symbols)} confirmed writes/exports or recorded skips.')
+
+    # A process can die during write(), before flush/fsync or checkpointing.
+    # Preserve the unconfirmed bytes, then resume at a durable transaction boundary.
+    # Do this even when every requested symbol is already complete.
+    if sql_out_path and sql_out_path.exists() and sql_out_path.stat().st_size > confirmed_sql_end:
+        with sql_out_path.open('r+b') as output:
+            output.seek(confirmed_sql_end)
+            with tempfile.NamedTemporaryFile(mode='wb', prefix=sql_out_path.name + '.unconfirmed-',
+                                             suffix='.bak', dir=sql_out_path.parent, delete=False) as backup:
+                shutil.copyfileobj(output, backup)
+                backup.flush()
+                os.fsync(backup.fileno())
+                backup_path = backup.name
+            output.truncate(confirmed_sql_end)
+            output.flush()
+            os.fsync(output.fileno())
+        sys.stderr.write(f'Preserved unconfirmed SQL tail in {backup_path}; resuming at byte {confirmed_sql_end}.\n')
 
     pending_taxa = [item for item in taxa_list if item[0] not in completed_symbols]
     if verbose:
@@ -1142,30 +1223,42 @@ def stream_online_import(
 
     if not pending_taxa:
         print("All plants have already been processed!")
-        return
+        return {'written': 0, 'skipped': 0, 'failed': 0}
 
     # Open SQL output file
     sql_file = None
     if sql_out_path:
         sql_out_path.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if completed_symbols and sql_out_path.exists() else "w"
-        is_new = mode == "w" or sql_out_path.stat().st_size == 0
-        sql_file = open(sql_out_path, mode, encoding="utf-8")
-        if is_new:
-            sql_file.write("-- USDA PLANTS Database Import (Streamed Online)\nBEGIN;\n\n")
-        else:
-            sql_file.write("\n-- Resumed Import\nBEGIN;\n\n")
+        sql_file = open(sql_out_path, 'a', encoding='utf-8')
 
     progress_log = None
     if progress_file_path:
         progress_file_path.parent.mkdir(parents=True, exist_ok=True)
+        if progress_file_path.exists() and progress_file_path.stat().st_size:
+            with open(progress_file_path, 'rb') as existing_progress:
+                existing_progress.seek(-1, os.SEEK_END)
+                needs_newline = existing_progress.read(1) != b'\n'
+            if needs_newline:
+                with open(progress_file_path, 'a', encoding='utf-8') as existing_progress:
+                    existing_progress.write('\n')
         progress_log = open(progress_file_path, "a", encoding="utf-8")
 
     total = len(pending_taxa)
     count = 0
     success = 0
     skipped = 0
+    failed = 0
     last_milestone_pct = 0
+
+    def record_progress(symbol: str, status: str, reason: str = '') -> None:
+        if progress_log:
+            event = {'version': 2, 'symbol': symbol, 'status': status, 'context': context,
+                     'reason': reason, 'recorded_at': int(time.time())}
+            if sql_file and status in {'written', 'exported'}:
+                event['sql_end'] = os.fstat(sql_file.fileno()).st_size
+            progress_log.write(json.dumps(event) + '\n')
+            progress_log.flush()
+            os.fsync(progress_log.fileno())
 
     try:
         def task_fn(item: Tuple[str, str, str]) -> Tuple[str, Optional[PlantRecord]]:
@@ -1198,62 +1291,68 @@ def stream_online_import(
 
                     try:
                         _, record = future.result()
+                    except DeliberateSkip as e:
+                        skipped += 1
+                        record_progress(sym, 'skipped', str(e))
+                        continue
                     except Exception as e:
                         if verbose:
                             sys.stderr.write(f"Error streaming {sym}: {e}\n")
                         record = None
 
                     if record:
-                        success += 1
                         # 1. Output SQL
+                        plant_sql = generate_sql([record])
                         if sql_file:
-                            append_plant_sql(sql_file, record)
+                            # Commit every exported plant before checkpointing so
+                            # interruption cannot leave completed rows in an open transaction.
+                            sql_file.write(plant_sql)
                             sql_file.flush()
+                            os.fsync(sql_file.fileno())
 
                         # 2. Direct DB execution if URL provided
+                        write_ok = True
                         if db_url:
-                            plant_sql = io.StringIO()
-                            plant_sql.write("BEGIN;\n")
-                            append_plant_sql(plant_sql, record)
-                            plant_sql.write("COMMIT;\n")
-                            execute_sql_against_db(plant_sql.getvalue(), db_url)
+                            write_ok = execute_sql_against_db(plant_sql, db_url) and write_ok
 
                         # 3. Real-time Supabase Edge Function / RPC execution
                         if supabase_url and supabase_key:
-                            upsert_plant_to_supabase(
+                            write_ok = upsert_plant_to_supabase(
                                 record,
                                 supabase_url,
                                 supabase_key,
                                 use_edge_function=use_edge_function,
-                            )
+                            ) and write_ok
+
+                        if write_ok:
+                            success += 1
+                            record_progress(sym, 'written' if db_url or supabase_url else 'exported')
+                        else:
+                            failed += 1
+                            record_progress(sym, 'retry', 'Database write failed; not complete')
 
                         # Discard record from memory!
                         del record
                     else:
-                        skipped += 1
-
-                    # Record in progress file
-                    if progress_log:
-                        progress_log.write(f"{sym}\n")
-                        progress_log.flush()
+                        failed += 1
+                        record_progress(sym, 'retry', 'Fetch or mapping failed; not a deliberate skip')
 
                     pct = (count / total) * 100
                     current_milestone = int(pct // 10) * 10
                     if current_milestone > last_milestone_pct:
                         last_milestone_pct = current_milestone
                         print(
-                            f"\n>>> PROGRESS MILESTONE: {current_milestone}% COMPLETE ({count}/{total}) | {success} plants live in DB, {skipped} skipped <<<\n",
+                            f"\n>>> PROGRESS MILESTONE: {current_milestone}% ATTEMPTED ({count}/{total}) | {success} confirmed, {skipped} deliberate skips, {failed} retryable failures <<<\n",
                             flush=True,
                         )
                     elif verbose and (count % 25 == 0 or count == total):
                         print(
-                            f"[{pct:5.1f}%] [{count}/{total}] {success} plants live in DB, {skipped} non-plants/varieties skipped.",
+                            f"[{pct:5.1f}%] [{count}/{total}] {success} confirmed, {skipped} deliberate skips, {failed} retryable failures.",
                             flush=True,
                         )
 
     finally:
         if sql_file:
-            sql_file.write("COMMIT;\n")
             sql_file.close()
             if verbose:
                 print(f"\nSQL script written to: {sql_out_path.resolve()}")
@@ -1262,9 +1361,11 @@ def stream_online_import(
 
     print("\nStreaming import complete!")
     print(f"Total processed: {count}")
-    print(f"Plants imported: {success}")
+    print(f"Confirmed writes/exports: {success}")
     print(f"Skipped:        {skipped}")
+    print(f"Retryable failures: {failed}")
     print("Zero CSV files left on disk.")
+    return {'written': success, 'skipped': skipped, 'failed': failed}
 
 
 def collect_csv_files(paths: List[str]) -> List[Path]:
@@ -1528,7 +1629,7 @@ def main() -> None:
         sql_out_path = Path(args.sql_out) if args.sql_out else None
         progress_path = Path(args.progress_file) if args.progress_file else None
 
-        stream_online_import(
+        result = stream_online_import(
             taxa_list=taxa_list,
             resolver=resolver,
             sql_out_path=sql_out_path,
@@ -1541,6 +1642,8 @@ def main() -> None:
             supabase_key=args.supabase_key,
             use_edge_function=not args.use_rpc,
         )
+        if result['failed']:
+            sys.exit(1)
         return
 
     # 2. Local File Mode
