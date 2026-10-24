@@ -8,7 +8,7 @@ test('migrations and search execute against Postgres with common-name relationsh
   try {
     // Supabase normally supplies these roles.
     await db.exec('create role anon; create role authenticated;');
-    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql', '202610240003_public_search.sql', '202610240004_rpc_only_public_search.sql']) {
+    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql', '202610240003_public_search.sql', '202610240004_rpc_only_public_search.sql', '202610240005_name_search_ids.sql']) {
       await db.exec(await readFile(new URL(`../supabase/migrations/${file}`, import.meta.url), 'utf8'));
     }
     await db.exec(`
@@ -24,30 +24,31 @@ test('migrations and search execute against Postgres with common-name relationsh
       set role authenticated;
     `);
     async function search(filters: Record<string, unknown>) {
-      const { rows } = await db.query<{ result: { data: { plant_id: number }[]; total: number; page: number } }>(
+      const { rows } = await db.query<{ result: number[] }>(
         'select public.search_plants($1::jsonb) as result', [JSON.stringify(filters)],
       );
       return rows[0].result;
     }
-    assert.equal((await search({ search: 'BUTTERFLY' })).total, 2, 'multiple aliases never duplicate plants');
-    assert.equal((await search({ search: 'milkweed' })).total, 2);
-    assert.equal((await search({ search: 'Asclepias tuberosa' })).data[0].plant_id, 1);
-    assert.equal((await search({ search: 'alba' })).data[0].plant_id, 3, 'scientific search works without matching aliases');
-    assert.equal((await search({ search: 'Unused name' })).total, 0, 'unlinked names cannot match plants');
-    assert.equal((await search({ search: "%_' OR true; --" })).total, 0, 'punctuation is literal');
-    assert.equal((await search({ search: 'milkweed', county: ['51059'], lifeCycle: ['perennial'],
-      foliage: ['deciduous'], sun: ['full sun'], water: ['low'], thorns: false,
-      minHeight: 50, maxHeight: 70, minWidth: 30, maxWidth: 40 })).data[0].plant_id, 1);
-    assert.equal((await search({ search: 'milkweed', county: ['51059', '12095'] })).total, 2);
-    assert.equal((await search({ search: 'milkweed', water: ['low', 'high'] })).total, 2);
-    assert.equal((await search({ thorns: false })).total, 2, 'unknown booleans do not count as false');
-    const empty = await search({ search: 'milkweed', page: 3, pageSize: 1 });
-    assert.deepEqual(empty.data, []);
-    assert.equal(empty.total, 2);
+    assert.deepEqual(await search({ search: 'BUTTERFLY' }), [1, 2], 'multiple aliases never duplicate plants');
+    assert.deepEqual(await search({ search: 'milkweed' }), [1, 2]);
+    assert.deepEqual(await search({ search: ' Asclepias   tuberosa ' }), [1]);
+    assert.deepEqual(await search({ search: 'alba' }), [3], 'scientific search works without matching aliases');
+    assert.deepEqual(await search({ search: 'Unused name' }), [], 'unlinked names cannot match plants');
+    assert.deepEqual(await search({ search: "%_' OR true; --" }), [], 'punctuation is literal');
+    for (const invalid of [{}, { search: '' }, { search: '   ' }, { search: null },
+      { search: 123 }, { search: 'oak', isWoody: true }, { search: 'a'.repeat(201) }]) {
+      await assert.rejects(search(invalid), /search/i);
+    }
+    // Return all IDs, not just a default page of 25 or 100 records.
+    await db.exec(`reset role;
+      insert into public.plants (genus, species)
+      select 'Bulk', 'species' || i from generate_series(1, 105) i;
+      set role authenticated;`);
+    assert.equal((await search({ search: 'Bulk' })).length, 105);
     await db.exec('reset role; delete from public.common_names where name = \'Butterfly weed\'; set role authenticated;');
-    assert.equal((await search({ search: 'Butterfly weed' })).total, 0, 'deleted aliases cascade');
+    assert.deepEqual(await search({ search: 'Butterfly weed' }), [], 'deleted aliases cascade');
     await db.exec('reset role; set role anon;');
-    assert.equal((await search({ search: 'milkweed', county: ['51059'] })).total, 1);
+    assert.deepEqual(await search({ search: 'milkweed' }), [1, 2]);
     for (const table of ['plants', 'county_info', 'plant_county', 'common_names', 'common_plant']) {
       await assert.rejects(db.query(`select * from public.${table}`), /permission denied/);
     }
