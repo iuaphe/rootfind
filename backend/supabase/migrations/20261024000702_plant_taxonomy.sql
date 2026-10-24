@@ -112,6 +112,7 @@ begin
 end;
 $$;
 
+revoke execute on function public.upsert_plant_taxonomy(integer, jsonb) from public, anon;
 grant execute on function public.upsert_plant_taxonomy(integer, jsonb) to authenticated;
 
 do $$ begin

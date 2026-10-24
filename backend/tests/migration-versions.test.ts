@@ -15,5 +15,7 @@ test('SQL migration filenames have unique numeric versions', async () => {
   const ordered = files.sort();
   assert.ok(ordered.indexOf('20261024000601_upsert_plant.sql') < ordered.indexOf('202610240007_plant_details.sql'));
   assert.ok(seen.has('20261024000701'), 'Search filters must have their own migration version');
+  assert.ok(seen.has('20261024000702'), 'Taxonomy must have its own migration version');
+  assert.ok(ordered.indexOf('20261024000702_plant_taxonomy.sql') < ordered.indexOf('202610240008_mobot_enrichment.sql'));
   assert.ok(ordered.indexOf('20261024000701_search_filters.sql') < ordered.indexOf('202610240008_mobot_enrichment.sql'));
 });
