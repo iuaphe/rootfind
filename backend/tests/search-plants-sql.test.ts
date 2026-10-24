@@ -7,15 +7,15 @@ test('migrations and search execute against Postgres with common-name relationsh
   const db = new PGlite();
   try {
     // Supabase normally supplies these roles.
-    await db.exec('create role anon; create role authenticated;');
-    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql', '202610240003_public_search.sql', '202610240004_rpc_only_public_search.sql', '202610240005_name_search_ids.sql', '202610240007_search_filters.sql']) {
+    await db.exec('create role anon; create role authenticated; create role service_role;');
+    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql', '202610240003_public_search.sql', '202610240004_rpc_only_public_search.sql', '202610240005_name_search_ids.sql', '20261024000701_search_filters.sql', '202610240008_mobot_enrichment.sql', '202610240009_search_water_pagination.sql']) {
       await db.exec(await readFile(new URL(`../supabase/migrations/${file}`, import.meta.url), 'utf8'));
     }
     await db.exec(`
       insert into public.plants (genus, species, life_cycle, foliage, sun, water, minheight, maxheight, minwidth, maxwidth, thorns)
-      values ('Asclepias', 'tuberosa', 'perennial', 'deciduous', 'full sun', 'low', 10, 60, 20, 40, false),
-        ('Asclepias', 'incarnata', 'annual', 'evergreen', 'full shade', 'high', 30, 100, 30, 50, true),
-        ('Quercus', 'alba', 'perennial', 'deciduous', 'part shade', 'med', 100, 500, 100, 400, null);
+      values ('Asclepias', 'tuberosa', 'perennial', 'deciduous', 'full sun', array['low']::public.water_level_enum[], 10, 60, 20, 40, false),
+        ('Asclepias', 'incarnata', 'annual', 'evergreen', 'full shade', array['high']::public.water_level_enum[], 30, 100, 30, 50, true),
+        ('Quercus', 'alba', 'perennial', 'deciduous', 'part shade', array['medium']::public.water_level_enum[], 100, 500, 100, 400, null);
       update public.plants set is_woody = plant_id = 3, is_tree = plant_id = 3, edible = plant_id = 1;
       insert into public.county_info values (51059, 'Fairfax'), (12095, 'Orange');
       insert into public.plant_county values (51059, 1), (12095, 2);
@@ -50,7 +50,7 @@ test('migrations and search execute against Postgres with common-name relationsh
     assert.deepEqual(await search({ minWidth: 51, maxWidth: 99 }), []);
     for (const invalid of [{ search: null }, { search: 123 }, { search: 'a'.repeat(201) },
       { isWoody: 'true' }, { edible: null }, { thorns: 1 }, { lifeCycle: [] }, { lifeCycle: ['unknown'] },
-      { foliage: 'deciduous' }, { sun: [null] }, { water: ['medium'] }, { minHeight: -1 },
+      { foliage: 'deciduous' }, { sun: [null] }, { water: ['bog'] }, { minHeight: -1 },
       { minWidth: 1.5 }, { maxWidth: 32768 }, { minHeight: '12' }, { minHeight: 30, maxHeight: 20 },
       { minWidth: 30, maxWidth: 20 }, { unknown: true }]) {
       await assert.rejects(search(invalid), undefined, JSON.stringify(invalid));
@@ -60,12 +60,15 @@ test('migrations and search execute against Postgres with common-name relationsh
       set role authenticated;`);
     assert.deepEqual(await search({ minHeight: 1 }), [1, 2, 3], 'unknown measurements are excluded only by active filters');
     assert.equal((await search({})).length, 4, 'unfiltered searches include unknown measurements');
-    // Return all IDs, not just a default page of 25 or 100 records.
+    // Broad searches return bounded pages in stable ID order.
     await db.exec(`reset role;
       insert into public.plants (genus, species)
       select 'Bulk', 'species' || i from generate_series(1, 105) i;
       set role authenticated;`);
-    assert.equal((await search({ search: 'Bulk' })).length, 105);
+    assert.equal((await search({ search: 'Bulk' })).length, 50);
+    assert.equal((await search({ search: 'Bulk', page: 2 })).length, 50);
+    assert.equal((await search({ search: 'Bulk', page: 3 })).length, 5);
+    assert.deepEqual(await search({ search: 'Bulk', page: 4 }), []);
     await db.exec('reset role; delete from public.common_names where name = \'Butterfly weed\'; set role authenticated;');
     assert.deepEqual(await search({ search: 'Butterfly weed' }), [], 'deleted aliases cascade');
     await db.exec('reset role; set role anon;');

@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 
 const execFileAsync = promisify(execFile);
@@ -113,9 +114,9 @@ ASTU,United States,Virginia,51,Fairfax,059
 
     // 4. Run import_usda.py generating SQL
     const sqlOutPath = join(testDir, 'import.sql');
-    const scriptPath = join(new URL('../scripts/import_usda.py', import.meta.url).pathname);
+    const scriptPath = fileURLToPath(new URL('../scripts/import_usda.py', import.meta.url));
 
-    await execFileAsync('python3', [
+    await execFileAsync(process.platform === 'win32' ? 'python' : 'python3', [
       scriptPath,
       join(testDir, '*.csv'),
       '--sql-out', sqlOutPath,

@@ -69,7 +69,7 @@ test('limits lookup requests before calling Postgres', async (t) => {
 test('Postgres returns all plant columns and linked arrays without multiplying records', async () => {
   const db = new PGlite();
   try {
-    await db.exec('create role anon; create role authenticated;');
+    await db.exec('create role anon; create role authenticated; create role service_role;');
     const dir = new URL('../supabase/migrations/', import.meta.url);
     for (const name of (await readdir(dir)).filter((name) => name.endsWith('.sql')).sort()) {
       await db.exec(await readFile(new URL(name, dir), 'utf8'));
@@ -78,7 +78,7 @@ test('Postgres returns all plant columns and linked arrays without multiplying r
       insert into public.plants (genus, species, life_cycle, foliage, minheight, maxheight,
         minwidth, maxwidth, is_woody, is_tree, edible, thorns, sun, water, image_link, misc)
       values ('Asclepias', 'tuberosa', 'perennial', 'deciduous', 10, 60, 20, 40, false,
-        false, false, false, 'full sun', 'low', 'https://example.test/plant.jpg', array['fragrant']),
+        false, false, false, 'full sun', array['low']::public.water_level_enum[], 'https://example.test/plant.jpg', array['fragrant']),
         ('Quercus', 'alba', null, null, null, null, null, null, null, null, null, null, null, null, null, null);
       insert into public.county_info values (51059, 'Fairfax'), (12095, 'Orange');
       insert into public.plant_county values (51059, 1), (12095, 1);
@@ -92,8 +92,9 @@ test('Postgres returns all plant columns and linked arrays without multiplying r
     assert.deepEqual(await lookup(1), {
       plant_id: 1, genus: 'Asclepias', species: 'tuberosa', life_cycle: 'perennial', foliage: 'deciduous',
       minheight: 10, maxheight: 60, minwidth: 20, maxwidth: 40, is_woody: false, is_tree: false,
-      edible: false, thorns: false, sun: 'full sun', water: 'low', image_link: 'https://example.test/plant.jpg',
+      edible: false, thorns: false, sun: 'full sun', water: ['low'], image_link: 'https://example.test/plant.jpg',
       misc: ['fragrant'], common_names: ['Butterfly milkweed', 'Butterfly weed'], county_fips: [12095, 51059],
+      min_zone: null, max_zone: null, bloom_months: null,
     });
     const noLinks = await lookup(2);
     assert.deepEqual(noLinks?.common_names, []);

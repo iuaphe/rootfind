@@ -28,3 +28,4 @@ vite.config.ts.timestamp-*
 __pycache__/
 *.pyc
 .usda_cache/
+.mobot/
