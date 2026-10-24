@@ -1364,7 +1364,33 @@ def process_local_csv_files(
 process_csv_files = process_local_csv_files
 
 
+def load_env_file(env_path: Optional[Path] = None) -> None:
+    """Loads environment variables from .env files if present."""
+    candidates = [
+        env_path,
+        Path(".env"),
+        Path("backend/.env"),
+        Path(__file__).resolve().parent.parent / ".env",
+        Path(__file__).resolve().parent.parent.parent / ".env",
+    ]
+    for p in candidates:
+        if p and p.exists() and p.is_file():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+
 def main() -> None:
+    load_env_file()
     parser = argparse.ArgumentParser(
         description="Import USDA PLANTS data into Postgres database with zero or minimal disk usage."
     )
