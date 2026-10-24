@@ -1,4 +1,4 @@
-# Plant name search
+# Plant search
 
 ## County lookup
 
@@ -61,9 +61,25 @@ name linked through `common_plant` and `common_names`. Results contain unique ID
 in ascending order. No matches return `[]`. All matching IDs are returned, without
 pagination, counts, or plant fields.
 
-The only accepted parameter is `search`, supplied exactly once, with 1–200
-characters after trimming and whitespace normalization. Other parameters,
-including previous trait filters, `page`, and `pageSize`, return HTTP 400.
+The optional `search` parameter accepts up to 200 characters after trimming and
+whitespace normalization. Omitting it searches all plants. Optional filters:
+
+| Parameter | Values |
+| --- | --- |
+| `lifeCycle` | `perennial`, `biennial`, `annual` |
+| `foliage` | `deciduous`, `evergreen` |
+| `sun` | `full sun`, `part shade`, `full shade` |
+| `water` | `high`, `med`, `low` |
+| `isWoody`, `isTree`, `edible`, `thorns` | `true` or `false` |
+| `minHeight`, `maxHeight`, `minWidth`, `maxWidth` | Whole inches, 0–32767 |
+
+Pass enum selections as comma-separated values, for example
+`?search=oak&lifeCycle=perennial,annual&isWoody=true&minHeight=12&maxHeight=72`.
+Selections within a group are combined with OR; different groups use AND.
+Measurement intervals overlap the plant's recorded range, including endpoints.
+Omitted filters impose no restriction; an active filter excludes unknown values
+for the fields it compares. Parameters may appear only once. Unknown parameters,
+invalid options, and minimums greater than maximums return HTTP 400.
 
 ## Frontend
 
@@ -88,16 +104,16 @@ responses allow short public caching.
 
 ## Apply this update
 
-For an existing hosted project with migrations 001–004 applied:
+For an existing hosted project with the name search RPC:
 
-1. Run `supabase/migrations/202610240005_name_search_ids.sql` in the SQL Editor.
+1. Run `supabase/migrations/202610240007_search_filters.sql` in the SQL Editor.
 2. Redeploy `search-plants`, including `index.ts`, `handler.ts`, and `query.ts`.
 3. Keep JWT verification off in the Dashboard (matching `config.toml`).
 
 The SQL update replaces the existing RPC while preserving its argument and return
-SQL types. Its JSON response changes from a paginated object to an ID array, so
-update callers accordingly. Existing RPC clients still use
-`{"p_filters":{"search":"milkweed"}}`; other filter keys are rejected.
+types and ID-array response. Direct RPC clients pass enum arrays, boolean values,
+and numeric measurements in `p_filters`, for example
+`{"p_filters":{"search":"milkweed","lifeCycle":["perennial"],"minHeight":12}}`.
 
 No hosted migration or deployment is performed by editing these files.
 
@@ -128,8 +144,8 @@ npm ci
 npm test
 ```
 
-Tests run all migrations in PGlite (embedded Postgres), checking scientific names,
+Tests run the search migrations in PGlite (embedded Postgres), checking scientific names,
 common-name aliases, duplicate prevention, literal punctuation, more than 100
 matches, anonymous RPC access, input validation, and denial of direct table reads
-and writes. HTTP tests use a mocked database API. These do not replace testing the
+and writes, trait combinations, measurement overlap, and invalid filters. HTTP tests use a mocked database API. These do not replace testing the
 deployed Edge Function.

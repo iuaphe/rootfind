@@ -93,7 +93,7 @@ test('throttles batches per forwarded IP before reading the body or calling the 
 test('Postgres returns county FIPS per input position without granting table access', async () => {
   const db = new PGlite();
   try {
-    await db.exec('create role anon; create role authenticated;');
+    await db.exec('create role anon; create role authenticated; create role service_role;');
     const dir = new URL('../supabase/migrations/', import.meta.url);
     for (const name of (await readdir(dir)).filter((name) => name.endsWith('.sql')).sort()) {
       await db.exec(await readFile(new URL(name, dir), 'utf8'));

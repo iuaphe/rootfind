@@ -8,11 +8,34 @@ test('normalizes scientific and common name searches', () => {
   assert.deepEqual(parseQuery(new URLSearchParams('search=butterfly+weed')), { search: 'butterfly weed' });
 });
 
-test('requires one nonempty name search and rejects other parameters', () => {
+test('allows browsing without a name and rejects invalid or repeated parameters', () => {
+  assert.deepEqual(parseQuery(new URLSearchParams()), {});
+  assert.deepEqual(parseQuery(new URLSearchParams('search=+++')), { search: '' });
   for (const query of [
-    '', 'search=', 'search=+++', 'search=a&search=b', 'search=oak&isWoody=true',
+    'search=a&search=b', 'search=oak&isWoody=yes',
     'search=oak&page=1', 'search=oak&pageSize=10', 'toString=x', '__proto__=x',
     `search=${'a'.repeat(201)}`,
+  ]) assert.throws(() => parseQuery(new URLSearchParams(query)), undefined, query);
+});
+
+test('parses multiple enum selections, explicit booleans, and measurement intervals', () => {
+  assert.deepEqual(parseQuery(new URLSearchParams({
+    search: 'oak', lifeCycle: 'annual,perennial,annual', foliage: 'deciduous', sun: 'full sun,part shade',
+    water: 'med,low', isWoody: 'true', isTree: 'false', edible: 'true', thorns: 'false',
+    minHeight: '0', maxHeight: '32767', minWidth: '10', maxWidth: '20',
+  })), {
+    search: 'oak', lifeCycle: ['annual', 'perennial'], foliage: ['deciduous'], sun: ['full sun', 'part shade'],
+    water: ['med', 'low'], isWoody: true, isTree: false, edible: true, thorns: false,
+    minHeight: 0, maxHeight: 32767, minWidth: 10, maxWidth: 20,
+  });
+});
+
+test('rejects invalid enum options, measurements, reversed ranges, and duplicates', () => {
+  for (const query of [
+    'lifeCycle=', 'lifeCycle=annual,unknown', 'lifeCycle=Annual', 'foliage=annual', 'sun=low', 'water=medium',
+    'minHeight=-1', 'maxHeight=32768', 'minWidth=1.5', 'maxWidth=1e2', 'minHeight=01',
+    'minHeight=20&maxHeight=10', 'minWidth=20&maxWidth=10', 'water=low&water=high',
+    'edible=null', 'thorns=1', 'minHeight=1&minHeight=2',
   ]) assert.throws(() => parseQuery(new URLSearchParams(query)), undefined, query);
 });
 
@@ -22,6 +45,17 @@ test('search punctuation stays literal data', () => {
 });
 
 const settings = { url: 'https://example.supabase.co', anonKey: 'public-key' };
+test('forwards validated filters in the existing RPC payload', async () => {
+  const handler = createHandler(settings, async (_url, init) => {
+    assert.deepEqual(JSON.parse(init?.body as string), {
+      p_filters: { lifeCycle: ['annual', 'biennial'], edible: true, minHeight: 12, maxHeight: 36 },
+    });
+    return Response.json([1]);
+  });
+  const result = await handler(new Request('https://edge.test/?lifeCycle=annual,biennial&edible=true&minHeight=12&maxHeight=36'));
+  assert.equal(result.status, 200);
+  assert.deepEqual(await result.json(), [1]);
+});
 test('public requests return only ID arrays and use anon database credentials', async () => {
   const payload = [1, 3];
   const handler = createHandler(settings, async (url, init) => {

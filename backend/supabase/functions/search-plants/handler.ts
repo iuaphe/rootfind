@@ -36,7 +36,7 @@ function isRateLimited(ip: string, now = Date.now()) {
   return current.count > RATE_LIMIT;
 }
 
-// Public name lookup returns ID arrays; retain the best-effort per-runtime throttle.
+// Public plant search returns ID arrays; retain the best-effort per-runtime throttle.
 export function createHandler(settings: Settings, fetcher: typeof fetch = fetch) {
   return async (request: Request): Promise<Response> => {
     const headers = {
@@ -59,12 +59,12 @@ export function createHandler(settings: Settings, fetcher: typeof fetch = fetch)
           status: 429, headers: { ...headers, 'Retry-After': '60' },
         });
       }
-      const nameQuery = parseQuery(new URL(request.url).searchParams);
+      const filters = parseQuery(new URL(request.url).searchParams);
       if (!settings.url || !settings.anonKey) throw new Error('Supabase environment is missing');
       const result = await fetcher(`${settings.url}/rest/v1/rpc/search_plants`, {
         method: 'POST',
         headers: { apikey: settings.anonKey, Authorization: `Bearer ${settings.anonKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ p_filters: nameQuery }),
+        body: JSON.stringify({ p_filters: filters }),
         signal: AbortSignal.timeout(10000),
       });
       if (!result.ok) {

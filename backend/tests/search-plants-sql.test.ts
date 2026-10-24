@@ -8,14 +8,15 @@ test('migrations and search execute against Postgres with common-name relationsh
   try {
     // Supabase normally supplies these roles.
     await db.exec('create role anon; create role authenticated;');
-    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql', '202610240003_public_search.sql', '202610240004_rpc_only_public_search.sql', '202610240005_name_search_ids.sql']) {
+    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql', '202610240003_public_search.sql', '202610240004_rpc_only_public_search.sql', '202610240005_name_search_ids.sql', '202610240007_search_filters.sql']) {
       await db.exec(await readFile(new URL(`../supabase/migrations/${file}`, import.meta.url), 'utf8'));
     }
     await db.exec(`
       insert into public.plants (genus, species, life_cycle, foliage, sun, water, minheight, maxheight, minwidth, maxwidth, thorns)
       values ('Asclepias', 'tuberosa', 'perennial', 'deciduous', 'full sun', 'low', 10, 60, 20, 40, false),
-        ('Asclepias', 'incarnata', 'perennial', 'deciduous', 'full sun', 'high', 30, 100, 30, 50, false),
+        ('Asclepias', 'incarnata', 'annual', 'evergreen', 'full shade', 'high', 30, 100, 30, 50, true),
         ('Quercus', 'alba', 'perennial', 'deciduous', 'part shade', 'med', 100, 500, 100, 400, null);
+      update public.plants set is_woody = plant_id = 3, is_tree = plant_id = 3, edible = plant_id = 1;
       insert into public.county_info values (51059, 'Fairfax'), (12095, 'Orange');
       insert into public.plant_county values (51059, 1), (12095, 2);
       insert into public.common_names values ('Butterfly milkweed'), ('Butterfly weed'), ('Swamp milkweed'), ('White oak'), ('Unused name');
@@ -35,10 +36,30 @@ test('migrations and search execute against Postgres with common-name relationsh
     assert.deepEqual(await search({ search: 'alba' }), [3], 'scientific search works without matching aliases');
     assert.deepEqual(await search({ search: 'Unused name' }), [], 'unlinked names cannot match plants');
     assert.deepEqual(await search({ search: "%_' OR true; --" }), [], 'punctuation is literal');
-    for (const invalid of [{}, { search: '' }, { search: '   ' }, { search: null },
-      { search: 123 }, { search: 'oak', isWoody: true }, { search: 'a'.repeat(201) }]) {
-      await assert.rejects(search(invalid), /search/i);
+    assert.deepEqual(await search({}), [1, 2, 3], 'browse without a name');
+    assert.deepEqual(await search({ lifeCycle: ['annual', 'perennial'] }), [1, 2, 3], 'OR within an enum');
+    assert.deepEqual(await search({ lifeCycle: ['perennial'], water: ['low'] }), [1], 'AND across filters');
+    assert.deepEqual(await search({ search: 'Butterfly', thorns: true }), [2], 'traits apply to common names');
+    assert.deepEqual(await search({ foliage: ['evergreen'], sun: ['full shade'] }), [2]);
+    assert.deepEqual(await search({ isWoody: true, isTree: true }), [3]);
+    assert.deepEqual(await search({ edible: true }), [1]);
+    assert.deepEqual(await search({ thorns: false }), [1], 'unknown booleans do not match false');
+    assert.deepEqual(await search({ minHeight: 60, maxHeight: 60 }), [1, 2], 'inclusive overlap boundaries');
+    assert.deepEqual(await search({ minHeight: 61, maxHeight: 99 }), [2]);
+    assert.deepEqual(await search({ minWidth: 40, maxWidth: 40 }), [1, 2]);
+    assert.deepEqual(await search({ minWidth: 51, maxWidth: 99 }), []);
+    for (const invalid of [{ search: null }, { search: 123 }, { search: 'a'.repeat(201) },
+      { isWoody: 'true' }, { edible: null }, { thorns: 1 }, { lifeCycle: [] }, { lifeCycle: ['unknown'] },
+      { foliage: 'deciduous' }, { sun: [null] }, { water: ['medium'] }, { minHeight: -1 },
+      { minWidth: 1.5 }, { maxWidth: 32768 }, { minHeight: '12' }, { minHeight: 30, maxHeight: 20 },
+      { minWidth: 30, maxWidth: 20 }, { unknown: true }]) {
+      await assert.rejects(search(invalid), undefined, JSON.stringify(invalid));
     }
+    await db.exec(`reset role;
+      insert into public.plants (genus, species) values ('Unknown', 'measurements');
+      set role authenticated;`);
+    assert.deepEqual(await search({ minHeight: 1 }), [1, 2, 3], 'unknown measurements are excluded only by active filters');
+    assert.equal((await search({})).length, 4, 'unfiltered searches include unknown measurements');
     // Return all IDs, not just a default page of 25 or 100 records.
     await db.exec(`reset role;
       insert into public.plants (genus, species)
