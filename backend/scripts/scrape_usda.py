@@ -251,6 +251,8 @@ def scrape_single_plant(
         return None
 
     # Check rank and scientific name
+    rank = profile.get("Rank", "")
+    sci_name = profile.get("ScientificName", "")
     if rank and rank.lower() in ("variety", "subspecies", "subtaxa", "form"):
         return None
     if is_variety_or_subspecies(sci_name):
@@ -305,24 +307,65 @@ def scrape_all_plants(
     delay: float = 0.0,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """Scrapes plants concurrently and writes metadata file."""
+    """Scrapes plants concurrently, saves metadata incrementally, and supports resumption."""
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata_map: Dict[str, Any] = {}
 
-    total = len(taxa_list)
+    # Load existing metadata if resuming
+    if metadata_out_path and metadata_out_path.exists():
+        try:
+            with open(metadata_out_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    metadata_map = loaded
+                    if verbose:
+                        print(f"Resuming: loaded {len(metadata_map)} existing plant metadata entries.")
+        except Exception:
+            pass
+
+    # Filter out plants already completely scraped if not force
+    pending_taxa: List[Tuple[str, str, str]] = []
+    for item in taxa_list:
+        sym = item[0]
+        csv_file = output_dir / f"{sym}.csv"
+        if not force and csv_file.exists() and sym in metadata_map:
+            continue
+        pending_taxa.append(item)
+
+    total_all = len(taxa_list)
+    already_done = total_all - len(pending_taxa)
+    if verbose and already_done > 0:
+        print(f"Skipping {already_done} already downloaded plants. {len(pending_taxa)} remaining to process.")
+
+    total = len(pending_taxa)
     completed = 0
-    success = 0
+    success = already_done
     skipped = 0
+
+    if total == 0:
+        if verbose:
+            print("All requested plants are already downloaded and cached!")
+        return metadata_map
 
     if verbose:
         print(f"Beginning download of {total} plants with {workers} worker thread(s)...")
+
+    def save_checkpoint() -> None:
+        if metadata_out_path:
+            try:
+                tmp_meta = metadata_out_path.with_suffix(".tmp")
+                with open(tmp_meta, "w", encoding="utf-8") as f:
+                    json.dump(metadata_map, f, indent=2)
+                tmp_meta.replace(metadata_out_path)
+            except Exception:
+                pass
 
     def worker_task(item: Tuple[str, str, str]) -> Optional[Dict[str, Any]]:
         sym, _, _ = item
         return scrape_single_plant(sym, output_dir, force=force, delay=delay)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(worker_task, item): item for item in taxa_list}
+        futures = {executor.submit(worker_task, item): item for item in pending_taxa}
         for future in concurrent.futures.as_completed(futures):
             completed += 1
             item = futures[future]
@@ -339,16 +382,14 @@ def scrape_all_plants(
                 if verbose:
                     sys.stderr.write(f"Error scraping {sym}: {e}\n")
 
-            if verbose and (completed % 25 == 0 or completed == total):
-                print(f"[{completed}/{total}] {success} downloaded, {skipped} skipped/failed.")
+            if completed % 25 == 0 or completed == total:
+                save_checkpoint()
+                if verbose:
+                    print(f"[{completed}/{total}] {success} total downloaded, {skipped} skipped/failed.")
 
-    # Save metadata JSON file
-    if metadata_out_path:
-        metadata_out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(metadata_out_path, "w", encoding="utf-8") as f:
-            json.dump(metadata_map, f, indent=2)
-        if verbose:
-            print(f"Saved metadata for {len(metadata_map)} plants to: {metadata_out_path.resolve()}")
+    save_checkpoint()
+    if verbose and metadata_out_path:
+        print(f"Saved metadata for {len(metadata_map)} plants to: {metadata_out_path.resolve()}")
 
     return metadata_map
 

@@ -2,9 +2,22 @@
 """
 import_usda.py
 
-Imports data from USDA PLANTS database CSV files (such as those downloaded from the
-"Download Data" button on species profile pages e.g. https://plants.sc.egov.usda.gov/plant-profile/SOCA6)
-into the Supabase / PostgreSQL database schema defined in backend/supabase/migrations/.
+Imports data from USDA PLANTS database into the PostgreSQL/Supabase database schema
+defined in backend/supabase/migrations/.
+
+Modes of operation:
+  1. Stream Online (Zero Disk Space for CSVs):
+     Reads each plant's profile and distribution CSV directly from the USDA API into memory,
+     extracts all plant attributes, counties, and joins, generates/executes SQL, and immediately
+     discards the CSV. Zero CSV files are stored on disk!
+     Usage:
+       python3 backend/scripts/import_usda.py --stream --checklist plantlst.txt --sql-out import.sql
+
+  2. Local File Import:
+     Imports existing .csv files from disk. If --delete-after is passed, deletes each .csv
+     file immediately after processing to conserve disk storage.
+     Usage:
+       python3 backend/scripts/import_usda.py /path/to/csvs/ --sql-out import.sql --delete-after
 
 Tables populated:
   - public.plants
@@ -14,23 +27,27 @@ Tables populated:
   - public.common_plant
 
 Key Rules:
+  - Non-plants (Lichens, Fungi) are excluded.
   - Missing information is marked as NULL.
   - Varieties and subspecies are excluded (skipped).
   - Hybrids are included, but their species epithet is formatted as "x hybridname".
   - All plant-county relations are added to the plant_county join table.
-  - Idempotent: safe to run multiple times or incrementally.
+  - Idempotent: safe to run multiple times, pause, or resume.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import io
+import itertools
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,9 +55,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# USDA API Base URL
+# USDA API & Checklist
 USDA_API_BASE = "https://plantsservices.sc.egov.usda.gov/api"
-DEFAULT_CACHE_DIR = ".usda_cache"
+DEFAULT_CHECKLIST_URL = "https://plants.sc.egov.usda.gov/DocumentLibrary/Txt/plantlst.txt"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; RootfindUSDAImport/1.0)"
+DEFAULT_PROGRESS_FILE = "import_progress.txt"
 
 # Database enum allowed values
 VALID_LIFE_CYCLES = {"perennial", "biennial", "annual"}
@@ -70,10 +89,48 @@ class PlantRecord:
     common_names: Set[str] = field(default_factory=set)
     counties: Set[Tuple[int, str]] = field(default_factory=set)  # (fips, name)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes plant record, counties, and common names to a dictionary for Supabase."""
+        return {
+            "plant": {
+                "genus": self.genus,
+                "species": self.species,
+                "life_cycle": self.life_cycle,
+                "foliage": self.foliage,
+                "minheight": self.minheight,
+                "maxheight": self.maxheight,
+                "minwidth": self.minwidth,
+                "maxwidth": self.maxwidth,
+                "is_woody": self.is_woody,
+                "is_tree": self.is_tree,
+                "edible": self.edible,
+                "thorns": self.thorns,
+                "sun": self.sun,
+                "water": self.water,
+                "image_link": self.image_link,
+                "misc": self.misc or [],
+            },
+            "counties": [{"fips": fips, "name": name} for fips, name in self.counties],
+            "common_names": sorted(list(self.common_names)),
+        }
+
 
 def strip_html(text: str) -> str:
     """Removes HTML tags from a string."""
     return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def is_variety_or_subspecies(sci_name: str) -> bool:
+    """Checks if a scientific name represents a variety, subspecies, or form."""
+    if not sci_name:
+        return False
+    return bool(
+        re.search(
+            r"(?:\bvar\.?|\bssp\.?|\bsubsp\.?|\bsubvar\.?|\bforma\b|\bf\.)",
+            sci_name,
+            re.IGNORECASE,
+        )
+    )
 
 
 def is_plant_taxon(
@@ -82,7 +139,7 @@ def is_plant_taxon(
 ) -> bool:
     """
     Verifies that the taxon is actually a plant (Kingdom Plantae),
-    filtering out non-plants such as lichens or fungi that are also indexed by USDA.
+    filtering out non-plants such as lichens or fungi that are also in the USDA database.
     """
     if direct_attrs:
         group_val = (direct_attrs.get("group") or direct_attrs.get("plant_group") or "").strip().lower()
@@ -151,11 +208,7 @@ def parse_botanical_identity(
             return None
 
     # Check scientific name text for infraspecific markers
-    if re.search(
-        r"(?:\bvar\.?|\bssp\.?|\bsubsp\.?|\bsubvar\.?|\bforma\b|\bf\.)",
-        clean_name,
-        re.IGNORECASE,
-    ):
+    if is_variety_or_subspecies(clean_name):
         return None
 
     # Replace multiplication sign (\u00d7) with standard 'x'
@@ -197,13 +250,13 @@ def parse_botanical_identity(
 class PlantMetadataResolver:
     """
     Resolves plant metadata (scientific name, common name, characteristics)
-    via local offline file, disk cache, or the USDA PLANTS API.
+    via local offline file, disk cache, or USDA PLANTS API.
     """
 
     def __init__(
         self,
         offline: bool = False,
-        cache_dir: Optional[str] = DEFAULT_CACHE_DIR,
+        cache_dir: Optional[str] = None,
         metadata_file: Optional[str] = None,
     ):
         self.offline = offline
@@ -236,7 +289,7 @@ class PlantMetadataResolver:
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; RootfindUSDAImport/1.0)",
+                "User-Agent": DEFAULT_USER_AGENT,
                 "Accept": "application/json",
             },
         )
@@ -257,7 +310,7 @@ class PlantMetadataResolver:
             chars = meta.get("Characteristics") or meta.get("characteristics") or []
             return meta, chars
 
-        # 2. Check disk cache
+        # 2. Check disk cache if enabled
         cached_profile = None
         cached_chars = None
         if self.cache_dir:
@@ -294,7 +347,7 @@ class PlantMetadataResolver:
                 char_url = f"{USDA_API_BASE}/PlantCharacteristics/{master_id}"
                 chars = self._fetch_json(char_url)
 
-            # Save to disk cache
+            # Save to disk cache if cache_dir configured
             if self.cache_dir:
                 try:
                     with open(self.cache_dir / f"{sym}_profile.json", "w", encoding="utf-8") as f:
@@ -308,20 +361,45 @@ class PlantMetadataResolver:
         return profile, chars
 
 
-def parse_csv_file(filepath: Path) -> Tuple[Optional[str], List[Tuple[int, str]], Dict[str, Any]]:
+def download_distribution_csv_in_memory(symbol: str, master_id: int, timeout: int = 20) -> Optional[str]:
     """
-    Parses a single USDA CSV file.
+    Downloads the plant distribution CSV directly into memory via HTTP POST.
+    Does NOT save to disk.
+    """
+    post_url = f"{USDA_API_BASE}/PlantProfile/getDownloadDistributionDocumentation"
+    payload = json.dumps({
+        "Field": "Symbol",
+        "Text": symbol,
+        "SortBy": "sortSciName",
+        "Offset": None,
+        "MasterId": master_id,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        post_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/csv",
+            "User-Agent": DEFAULT_USER_AGENT,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content = resp.read().decode("utf-8-sig", errors="replace")
+            return content
+    except Exception as e:
+        sys.stderr.write(f"Warning: Failed downloading distribution CSV for {symbol}: {e}\n")
+        return None
+
+
+def parse_csv_content(content: str) -> Tuple[Optional[str], List[Tuple[int, str]], Dict[str, Any]]:
+    """
+    Parses CSV text directly from memory.
     Returns:
       (symbol, list_of_counties, direct_plant_attrs)
-      where list_of_counties is a list of (fips, county_name)
     """
-    try:
-        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-            content = f.read()
-    except Exception as e:
-        sys.stderr.write(f"Error reading {filepath}: {e}\n")
-        return None, [], {}
-
     lines = content.splitlines()
     if not lines:
         return None, [], {}
@@ -361,12 +439,10 @@ def parse_csv_file(filepath: Path) -> Tuple[Optional[str], List[Tuple[int, str]]
         if not row:
             continue
 
-        # Extract symbol
         row_sym = get_val(row, "symbol", "plantsymbol", "accepted_symbol", "acceptedSymbol")
         if row_sym and not symbol:
             symbol = row_sym.strip().upper()
 
-        # Check for direct plant attributes in CSV
         for key in [
             "scientificname",
             "scientific_name",
@@ -398,13 +474,11 @@ def parse_csv_file(filepath: Path) -> Tuple[Optional[str], List[Tuple[int, str]]
             if val is not None and key not in direct_attrs:
                 direct_attrs[key] = val
 
-        # Extract County & FIPS
         county_name = get_val(row, "county", "countyname", "county_name")
         state_fip_str = get_val(row, "statefip", "statefips", "state_fip", "state_fips")
         county_fip_str = get_val(row, "countyfip", "countyfips", "county_fip", "county_fips")
         country = get_val(row, "country")
 
-        # Skip non-US or state-level entries (without county)
         if country and country.strip().lower() not in ("united states", "usa", "us"):
             continue
 
@@ -417,10 +491,35 @@ def parse_csv_file(filepath: Path) -> Tuple[Optional[str], List[Tuple[int, str]]
                     cleaned_name = county_name.strip()[:100]
                     counties.append((full_fips, cleaned_name))
             except ValueError:
-                # Non-numeric FIPS (e.g. state code like 'LB'), skip county relation
                 pass
 
     return symbol, counties, direct_attrs
+
+
+def parse_csv_file(
+    filepath: Path,
+    delete_after: bool = False,
+) -> Tuple[Optional[str], List[Tuple[int, str]], Dict[str, Any]]:
+    """
+    Parses a single USDA CSV file from disk, optionally deleting it immediately when done.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
+            content = f.read()
+    except Exception as e:
+        sys.stderr.write(f"Error reading {filepath}: {e}\n")
+        return None, [], {}
+
+    res = parse_csv_content(content)
+    del content
+
+    if delete_after:
+        try:
+            filepath.unlink()
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to delete {filepath}: {e}\n")
+
+    return res
 
 
 def map_plant_attributes(
@@ -431,7 +530,7 @@ def map_plant_attributes(
 ) -> Optional[PlantRecord]:
     """
     Combines profile, characteristics, and direct CSV attributes into a validated PlantRecord.
-    Enforces variety/subspecies filtering and hybrid formatting.
+    Enforces plant verification, variety/subspecies filtering, and hybrid formatting.
     Marks missing values as None.
     """
     # 0. Check that taxon is a true plant (Kingdom Plantae, not Lichen or Fungus)
@@ -456,16 +555,13 @@ def map_plant_attributes(
     if not genus_species and "genus" in direct_attrs and "species" in direct_attrs:
         g = direct_attrs["genus"].strip().capitalize()
         s = direct_attrs["species"].strip()
-        # Verify variety/subspecies
-        if not re.search(r"\b(var\.|ssp\.|subsp\.|subvar\.|f\.|forma)\b", s, re.IGNORECASE):
-            # Check hybrid
+        if not is_variety_or_subspecies(s):
             if s.startswith("x ") or s.startswith("×") or (raw_rank and raw_rank.lower() == "hybrid"):
                 clean_s = re.sub(r"^[xX×]\s*", "", s).lower()
                 genus_species = (g, f"x {clean_s}")
             else:
                 genus_species = (g, s.lower())
 
-    # If still no valid genus/species, or if it was excluded as a variety/subspecies
     if not genus_species:
         return None
 
@@ -506,7 +602,6 @@ def map_plant_attributes(
                 char_map[name.strip().lower()] = str(val).strip()
 
     # 3. Life Cycle
-    # Check direct_attrs -> profile Durations -> characteristics
     life_cycle_str = direct_attrs.get("lifecycle") or direct_attrs.get("life_cycle") or direct_attrs.get("duration")
     durations = (profile.get("Durations") or []) if profile else []
     dur_combined = " ".join(durations).lower() if durations else ""
@@ -522,7 +617,6 @@ def map_plant_attributes(
     else:
         lifespan = char_map.get("lifespan", "").lower()
         if lifespan in ("long", "moderate", "short"):
-            # Most USDA long/moderate lifespans are perennials
             record.life_cycle = "perennial"
         else:
             record.life_cycle = None
@@ -608,7 +702,6 @@ def map_plant_attributes(
             return False
         return None
 
-    # is_tree
     is_tree_direct = parse_bool(direct_attrs.get("istree") or direct_attrs.get("is_tree"))
     if is_tree_direct is not None:
         record.is_tree = is_tree_direct
@@ -619,7 +712,6 @@ def map_plant_attributes(
     else:
         record.is_tree = None
 
-    # is_woody
     is_woody_direct = parse_bool(direct_attrs.get("iswoody") or direct_attrs.get("is_woody"))
     if is_woody_direct is not None:
         record.is_woody = is_woody_direct
@@ -630,7 +722,6 @@ def map_plant_attributes(
     else:
         record.is_woody = None
 
-    # edible
     edible_direct = parse_bool(direct_attrs.get("edible"))
     if edible_direct is not None:
         record.edible = edible_direct
@@ -643,7 +734,6 @@ def map_plant_attributes(
         else:
             record.edible = None
 
-    # thorns
     thorns_direct = parse_bool(direct_attrs.get("thorns"))
     if thorns_direct is not None:
         record.thorns = thorns_direct
@@ -674,142 +764,117 @@ def escape_sql_str(val: str) -> str:
     return "'" + val.replace("'", "''") + "'"
 
 
-def generate_sql(records: List[PlantRecord]) -> str:
-    """
-    Generates a transaction-wrapped SQL migration script to insert all plants,
-    counties, common names, and relationship joins.
-    """
-    out = io.StringIO()
-    out.write("-- USDA PLANTS Database Import\n")
-    out.write("BEGIN;\n\n")
+def append_plant_sql(out: io.TextIOBase, p: PlantRecord) -> None:
+    """Appends SQL statements for a single plant and its relations to an open stream."""
+    genus_sql = escape_sql_str(p.genus)
+    species_sql = escape_sql_str(p.species)
+    life_cycle_sql = escape_sql_str(p.life_cycle) if p.life_cycle else "NULL"
+    foliage_sql = escape_sql_str(p.foliage) if p.foliage else "NULL"
+    minheight_sql = str(p.minheight) if p.minheight is not None else "NULL"
+    maxheight_sql = str(p.maxheight) if p.maxheight is not None else "NULL"
+    minwidth_sql = str(p.minwidth) if p.minwidth is not None else "NULL"
+    maxwidth_sql = str(p.maxwidth) if p.maxwidth is not None else "NULL"
+    is_woody_sql = "true" if p.is_woody is True else ("false" if p.is_woody is False else "NULL")
+    is_tree_sql = "true" if p.is_tree is True else ("false" if p.is_tree is False else "NULL")
+    edible_sql = "true" if p.edible is True else ("false" if p.edible is False else "NULL")
+    thorns_sql = "true" if p.thorns is True else ("false" if p.thorns is False else "NULL")
+    sun_sql = escape_sql_str(p.sun) if p.sun else "NULL"
+    water_sql = escape_sql_str(p.water) if p.water else "NULL"
+    image_link_sql = escape_sql_str(p.image_link) if p.image_link else "NULL"
 
-    # 1. Collect all distinct counties and common names
-    all_counties: Dict[int, str] = {}
-    all_common_names: Set[str] = set()
+    if p.misc:
+        elements = ", ".join(escape_sql_str(m) for m in p.misc)
+        misc_sql = f"ARRAY[{elements}]"
+    else:
+        misc_sql = "NULL"
 
-    for p in records:
-        for fips, name in p.counties:
-            all_counties[fips] = name
-        for cname in p.common_names:
-            all_common_names.add(cname)
-
-    # 2. Insert Counties
-    if all_counties:
-        out.write("-- 1. Counties\n")
+    # 1. Counties
+    if p.counties:
         county_values = [
             f"({fips}, {escape_sql_str(name)})"
-            for fips, name in sorted(all_counties.items())
+            for fips, name in sorted(p.counties)
         ]
-        batch_size = 500
-        for i in range(0, len(county_values), batch_size):
-            chunk = county_values[i : i + batch_size]
-            out.write("INSERT INTO public.county_info (fips, name) VALUES\n  ")
-            out.write(",\n  ".join(chunk))
-            out.write("\nON CONFLICT (fips) DO UPDATE SET name = EXCLUDED.name;\n")
-        out.write("\n")
+        out.write("INSERT INTO public.county_info (fips, name) VALUES\n  ")
+        out.write(",\n  ".join(county_values))
+        out.write("\nON CONFLICT (fips) DO UPDATE SET name = EXCLUDED.name;\n")
 
-    # 3. Insert Common Names
-    if all_common_names:
-        out.write("-- 2. Common Names\n")
-        name_values = [f"({escape_sql_str(name)})" for name in sorted(all_common_names)]
-        batch_size = 500
-        for i in range(0, len(name_values), batch_size):
-            chunk = name_values[i : i + batch_size]
-            out.write("INSERT INTO public.common_names (name) VALUES\n  ")
-            out.write(",\n  ".join(chunk))
-            out.write("\nON CONFLICT (name) DO NOTHING;\n")
-        out.write("\n")
+    # 2. Common Names
+    if p.common_names:
+        name_values = [f"({escape_sql_str(name)})" for name in sorted(p.common_names)]
+        out.write("INSERT INTO public.common_names (name) VALUES\n  ")
+        out.write(",\n  ".join(name_values))
+        out.write("\nON CONFLICT (name) DO NOTHING;\n")
 
-    # 4. Insert Plants
-    out.write("-- 3. Plants\n")
-    for p in records:
-        genus_sql = escape_sql_str(p.genus)
-        species_sql = escape_sql_str(p.species)
-        life_cycle_sql = escape_sql_str(p.life_cycle) if p.life_cycle else "NULL"
-        foliage_sql = escape_sql_str(p.foliage) if p.foliage else "NULL"
-        minheight_sql = str(p.minheight) if p.minheight is not None else "NULL"
-        maxheight_sql = str(p.maxheight) if p.maxheight is not None else "NULL"
-        minwidth_sql = str(p.minwidth) if p.minwidth is not None else "NULL"
-        maxwidth_sql = str(p.maxwidth) if p.maxwidth is not None else "NULL"
-        is_woody_sql = "true" if p.is_woody is True else ("false" if p.is_woody is False else "NULL")
-        is_tree_sql = "true" if p.is_tree is True else ("false" if p.is_tree is False else "NULL")
-        edible_sql = "true" if p.edible is True else ("false" if p.edible is False else "NULL")
-        thorns_sql = "true" if p.thorns is True else ("false" if p.thorns is False else "NULL")
-        sun_sql = escape_sql_str(p.sun) if p.sun else "NULL"
-        water_sql = escape_sql_str(p.water) if p.water else "NULL"
-        image_link_sql = escape_sql_str(p.image_link) if p.image_link else "NULL"
+    # 3. Plant
+    out.write(
+        f"INSERT INTO public.plants (\n"
+        f"  genus, species, life_cycle, foliage, minheight, maxheight, minwidth, maxwidth,\n"
+        f"  is_woody, is_tree, edible, thorns, sun, water, image_link, misc\n"
+        f") VALUES (\n"
+        f"  {genus_sql}, {species_sql}, {life_cycle_sql}, {foliage_sql},\n"
+        f"  {minheight_sql}, {maxheight_sql}, {minwidth_sql}, {maxwidth_sql},\n"
+        f"  {is_woody_sql}, {is_tree_sql}, {edible_sql}, {thorns_sql},\n"
+        f"  {sun_sql}, {water_sql}, {image_link_sql}, {misc_sql}\n"
+        f")\n"
+        f"ON CONFLICT (genus, species) DO UPDATE SET\n"
+        f"  life_cycle = COALESCE(EXCLUDED.life_cycle, public.plants.life_cycle),\n"
+        f"  foliage = COALESCE(EXCLUDED.foliage, public.plants.foliage),\n"
+        f"  minheight = COALESCE(EXCLUDED.minheight, public.plants.minheight),\n"
+        f"  maxheight = COALESCE(EXCLUDED.maxheight, public.plants.maxheight),\n"
+        f"  minwidth = COALESCE(EXCLUDED.minwidth, public.plants.minwidth),\n"
+        f"  maxwidth = COALESCE(EXCLUDED.maxwidth, public.plants.maxwidth),\n"
+        f"  is_woody = COALESCE(EXCLUDED.is_woody, public.plants.is_woody),\n"
+        f"  is_tree = COALESCE(EXCLUDED.is_tree, public.plants.is_tree),\n"
+        f"  edible = COALESCE(EXCLUDED.edible, public.plants.edible),\n"
+        f"  thorns = COALESCE(EXCLUDED.thorns, public.plants.thorns),\n"
+        f"  sun = COALESCE(EXCLUDED.sun, public.plants.sun),\n"
+        f"  water = COALESCE(EXCLUDED.water, public.plants.water),\n"
+        f"  image_link = COALESCE(EXCLUDED.image_link, public.plants.image_link),\n"
+        f"  misc = COALESCE(EXCLUDED.misc, public.plants.misc);\n"
+    )
 
-        if p.misc:
-            elements = ", ".join(escape_sql_str(m) for m in p.misc)
-            misc_sql = f"ARRAY[{elements}]"
-        else:
-            misc_sql = "NULL"
-
+    # 4. Common Plant Joins
+    if p.common_names:
+        cname_vals = ", ".join(f"({escape_sql_str(cn)})" for cn in sorted(p.common_names))
         out.write(
-            f"INSERT INTO public.plants (\n"
-            f"  genus, species, life_cycle, foliage, minheight, maxheight, minwidth, maxwidth,\n"
-            f"  is_woody, is_tree, edible, thorns, sun, water, image_link, misc\n"
-            f") VALUES (\n"
-            f"  {genus_sql}, {species_sql}, {life_cycle_sql}, {foliage_sql},\n"
-            f"  {minheight_sql}, {maxheight_sql}, {minwidth_sql}, {maxwidth_sql},\n"
-            f"  {is_woody_sql}, {is_tree_sql}, {edible_sql}, {thorns_sql},\n"
-            f"  {sun_sql}, {water_sql}, {image_link_sql}, {misc_sql}\n"
-            f")\n"
-            f"ON CONFLICT (genus, species) DO UPDATE SET\n"
-            f"  life_cycle = COALESCE(EXCLUDED.life_cycle, public.plants.life_cycle),\n"
-            f"  foliage = COALESCE(EXCLUDED.foliage, public.plants.foliage),\n"
-            f"  minheight = COALESCE(EXCLUDED.minheight, public.plants.minheight),\n"
-            f"  maxheight = COALESCE(EXCLUDED.maxheight, public.plants.maxheight),\n"
-            f"  minwidth = COALESCE(EXCLUDED.minwidth, public.plants.minwidth),\n"
-            f"  maxwidth = COALESCE(EXCLUDED.maxwidth, public.plants.maxwidth),\n"
-            f"  is_woody = COALESCE(EXCLUDED.is_woody, public.plants.is_woody),\n"
-            f"  is_tree = COALESCE(EXCLUDED.is_tree, public.plants.is_tree),\n"
-            f"  edible = COALESCE(EXCLUDED.edible, public.plants.edible),\n"
-            f"  thorns = COALESCE(EXCLUDED.thorns, public.plants.thorns),\n"
-            f"  sun = COALESCE(EXCLUDED.sun, public.plants.sun),\n"
-            f"  water = COALESCE(EXCLUDED.water, public.plants.water),\n"
-            f"  image_link = COALESCE(EXCLUDED.image_link, public.plants.image_link),\n"
-            f"  misc = COALESCE(EXCLUDED.misc, public.plants.misc);\n\n"
+            f"INSERT INTO public.common_plant (name, plant_id)\n"
+            f"SELECT v.name, p.plant_id\n"
+            f"FROM public.plants p\n"
+            f"CROSS JOIN (VALUES {cname_vals}) AS v(name)\n"
+            f"WHERE p.genus = {genus_sql} AND p.species = {species_sql}\n"
+            f"ON CONFLICT (name, plant_id) DO NOTHING;\n"
         )
 
-        # Common Plant Joins
-        if p.common_names:
-            cname_vals = ", ".join(f"({escape_sql_str(cn)})" for cn in sorted(p.common_names))
+    # 5. Plant County Joins
+    if p.counties:
+        county_fips_list = sorted({fips for fips, _ in p.counties})
+        for j in range(0, len(county_fips_list), 500):
+            fips_chunk = county_fips_list[j : j + 500]
+            fips_vals = ", ".join(f"({f})" for f in fips_chunk)
             out.write(
-                f"INSERT INTO public.common_plant (name, plant_id)\n"
-                f"SELECT v.name, p.plant_id\n"
+                f"INSERT INTO public.plant_county (fips, plant_id)\n"
+                f"SELECT v.fips, p.plant_id\n"
                 f"FROM public.plants p\n"
-                f"CROSS JOIN (VALUES {cname_vals}) AS v(name)\n"
+                f"CROSS JOIN (VALUES {fips_vals}) AS v(fips)\n"
                 f"WHERE p.genus = {genus_sql} AND p.species = {species_sql}\n"
-                f"ON CONFLICT (name, plant_id) DO NOTHING;\n\n"
+                f"ON CONFLICT (fips, plant_id) DO NOTHING;\n"
             )
 
-        # Plant County Joins
-        if p.counties:
-            county_fips_list = sorted({fips for fips, _ in p.counties})
-            fips_batches = [
-                county_fips_list[j : j + 500]
-                for j in range(0, len(county_fips_list), 500)
-            ]
-            for fips_chunk in fips_batches:
-                fips_vals = ", ".join(f"({f})" for f in fips_chunk)
-                out.write(
-                    f"INSERT INTO public.plant_county (fips, plant_id)\n"
-                    f"SELECT v.fips, p.plant_id\n"
-                    f"FROM public.plants p\n"
-                    f"CROSS JOIN (VALUES {fips_vals}) AS v(fips)\n"
-                    f"WHERE p.genus = {genus_sql} AND p.species = {species_sql}\n"
-                    f"ON CONFLICT (fips, plant_id) DO NOTHING;\n"
-                )
-            out.write("\n")
+    out.write("\n")
 
+
+def generate_sql(records: List[PlantRecord]) -> str:
+    """Generates complete SQL script for a batch of PlantRecords."""
+    out = io.StringIO()
+    out.write("-- USDA PLANTS Database Import\nBEGIN;\n\n")
+    for r in records:
+        append_plant_sql(out, r)
     out.write("COMMIT;\n")
     return out.getvalue()
 
 
 def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
     """Executes SQL against database using psycopg, psycopg2, or psql."""
-    # 1. Try psycopg (v3)
     try:
         import psycopg  # type: ignore
 
@@ -817,7 +882,6 @@ def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
             with conn.cursor() as cur:
                 cur.execute(sql_content)
             conn.commit()
-        print("Successfully applied SQL via psycopg.")
         return True
     except ImportError:
         pass
@@ -825,7 +889,6 @@ def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
         sys.stderr.write(f"psycopg error: {e}\n")
         return False
 
-    # 2. Try psycopg2
     try:
         import psycopg2  # type: ignore
 
@@ -833,7 +896,6 @@ def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
             with conn.cursor() as cur:
                 cur.execute(sql_content)
             conn.commit()
-        print("Successfully applied SQL via psycopg2.")
         return True
     except ImportError:
         pass
@@ -841,7 +903,6 @@ def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
         sys.stderr.write(f"psycopg2 error: {e}\n")
         return False
 
-    # 3. Fallback to psql command-line tool
     try:
         proc = subprocess.run(
             ["psql", db_url],
@@ -850,7 +911,6 @@ def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
             capture_output=True,
             check=True,
         )
-        print("Successfully applied SQL via psql CLI.")
         return True
     except FileNotFoundError:
         sys.stderr.write("Error: psql CLI not found and neither psycopg nor psycopg2 is installed.\n")
@@ -860,8 +920,343 @@ def execute_sql_against_db(sql_content: str, db_url: str) -> bool:
         return False
 
 
+def upsert_plant_to_supabase(
+    record: PlantRecord,
+    supabase_url: str,
+    service_key: str,
+    use_edge_function: bool = True,
+    timeout: int = 15,
+) -> bool:
+    """Upserts a single plant record in real time to Supabase via Edge Function or PostgREST RPC."""
+    url = (
+        f"{supabase_url.rstrip('/')}/functions/v1/upsert-plant"
+        if use_edge_function
+        else f"{supabase_url.rstrip('/')}/rest/v1/rpc/upsert_plant"
+    )
+    payload = record.to_dict() if use_edge_function else {"p_payload": record.to_dict()}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": service_key,
+            "Authorization": f"Bearer {service_key}",
+            "User-Agent": DEFAULT_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="replace")
+        sys.stderr.write(f"Supabase upsert HTTP {e.code} for {record.genus} {record.species}: {err_msg}\n")
+        return False
+    except Exception as e:
+        sys.stderr.write(f"Failed to upsert {record.genus} {record.species} to Supabase: {e}\n")
+        return False
+
+
+def upsert_plants_batch_to_supabase(
+    records: List[PlantRecord],
+    supabase_url: str,
+    service_key: str,
+    use_edge_function: bool = True,
+    timeout: int = 30,
+) -> bool:
+    """Upserts a batch of plant records in real time to Supabase."""
+    if not records:
+        return True
+    url = (
+        f"{supabase_url.rstrip('/')}/functions/v1/upsert-plant"
+        if use_edge_function
+        else f"{supabase_url.rstrip('/')}/rest/v1/rpc/upsert_plants_batch"
+    )
+    payload = [r.to_dict() for r in records] if use_edge_function else {"p_payload": [r.to_dict() for r in records]}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": service_key,
+            "Authorization": f"Bearer {service_key}",
+            "User-Agent": DEFAULT_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="replace")
+        sys.stderr.write(f"Supabase batch upsert HTTP {e.code}: {err_msg}\n")
+        return False
+    except Exception as e:
+        sys.stderr.write(f"Failed to upsert batch to Supabase: {e}\n")
+        return False
+
+
+def fetch_accepted_checklist(
+    checklist_path_or_url: str,
+    limit: Optional[int] = None,
+    verbose: bool = True,
+) -> List[Tuple[str, str, str]]:
+    """Loads accepted species & hybrids from USDA plantlst.txt."""
+    if os.path.exists(checklist_path_or_url):
+        if verbose:
+            print(f"Reading checklist from local file: {checklist_path_or_url}")
+        with open(checklist_path_or_url, "r", encoding="utf-8-sig", errors="replace") as f:
+            content = f.read()
+    else:
+        if verbose:
+            print(f"Downloading checklist from {checklist_path_or_url}...")
+        req = urllib.request.Request(checklist_path_or_url, headers={"User-Agent": DEFAULT_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8-sig", errors="replace")
+
+    reader = csv.reader(io.StringIO(content))
+    try:
+        header = next(reader)
+    except StopIteration:
+        return []
+
+    col_map = {col.strip().lower(): idx for idx, col in enumerate(header)}
+    sym_idx = col_map.get("symbol", 0)
+    syn_idx = col_map.get("synonym symbol", 1)
+    sci_idx = col_map.get("scientific name with author", 2)
+    com_idx = col_map.get("common name", 3)
+
+    taxa: List[Tuple[str, str, str]] = []
+    seen = set()
+
+    for row in reader:
+        if not row or len(row) <= sym_idx:
+            continue
+        symbol = row[sym_idx].strip().upper()
+        synonym = row[syn_idx].strip() if len(row) > syn_idx else ""
+        sci_name = row[sci_idx].strip() if len(row) > sci_idx else ""
+        com_name = row[com_idx].strip() if len(row) > com_idx else ""
+
+        if synonym != "":
+            continue
+        if is_variety_or_subspecies(sci_name):
+            continue
+
+        clean_sci = sci_name.replace("×", " x ").strip()
+        words = clean_sci.split()
+        if len(words) < 2 or not (words[1][0].islower() or words[1].lower() == "x"):
+            continue
+
+        if symbol not in seen:
+            seen.add(symbol)
+            taxa.append((symbol, sci_name, com_name))
+
+        if limit and len(taxa) >= limit:
+            break
+
+    if verbose:
+        print(f"Checklist loaded: {len(taxa)} accepted species/hybrids.")
+    return taxa
+
+
+def process_plant_online_in_memory(
+    symbol: str,
+    resolver: PlantMetadataResolver,
+    delay: float = 0.0,
+) -> Optional[PlantRecord]:
+    """
+    Downloads profile, characteristics, and distribution CSV directly into memory.
+    Parses attributes and counties, discards raw CSV text from RAM, and returns PlantRecord.
+    Zero disk files created!
+    """
+    if delay > 0:
+        time.sleep(delay)
+
+    profile, chars = resolver.get_plant_data(symbol)
+    if not profile or not isinstance(profile, dict):
+        return None
+
+    # Check plant kingdom and infraspecific rank
+    if not is_plant_taxon(profile):
+        return None
+
+    rank = profile.get("Rank", "")
+    sci_name = profile.get("ScientificName", "")
+    if rank and rank.lower() in ("variety", "subspecies", "subtaxa", "form"):
+        return None
+    if is_variety_or_subspecies(sci_name):
+        return None
+
+    master_id = profile.get("Id")
+    if not master_id:
+        return None
+
+    # Download distribution CSV directly into memory
+    csv_text = download_distribution_csv_in_memory(symbol, master_id)
+    if not csv_text:
+        counties = []
+        direct_attrs = {}
+    else:
+        _, counties, direct_attrs = parse_csv_content(csv_text)
+        del csv_text  # Free memory immediately!
+
+    record = map_plant_attributes(symbol, profile, chars, direct_attrs)
+    if record:
+        record.counties.update(counties)
+
+    return record
+
+
+def stream_online_import(
+    taxa_list: List[Tuple[str, str, str]],
+    resolver: PlantMetadataResolver,
+    sql_out_path: Optional[Path],
+    db_url: Optional[str],
+    progress_file_path: Optional[Path],
+    workers: int = 4,
+    delay: float = 0.0,
+    verbose: bool = True,
+    supabase_url: Optional[str] = None,
+    supabase_key: Optional[str] = None,
+    use_edge_function: bool = True,
+) -> None:
+    """
+    Streams online data plant-by-plant in memory, writes SQL / inserts into DB,
+    and discards data immediately. Zero CSV files stored on disk!
+    """
+    completed_symbols: Set[str] = set()
+    if progress_file_path and progress_file_path.exists():
+        try:
+            with open(progress_file_path, "r", encoding="utf-8") as f:
+                completed_symbols = {line.strip().upper() for line in f if line.strip()}
+            if verbose:
+                print(f"Resuming: {len(completed_symbols)} plants already processed previously.")
+        except Exception:
+            pass
+
+    pending_taxa = [item for item in taxa_list if item[0] not in completed_symbols]
+    if verbose:
+        print(f"Pending plants to process: {len(pending_taxa)} (out of {len(taxa_list)} total).")
+
+    if not pending_taxa:
+        print("All plants have already been processed!")
+        return
+
+    # Open SQL output file
+    sql_file = None
+    if sql_out_path:
+        sql_out_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if completed_symbols and sql_out_path.exists() else "w"
+        is_new = mode == "w" or sql_out_path.stat().st_size == 0
+        sql_file = open(sql_out_path, mode, encoding="utf-8")
+        if is_new:
+            sql_file.write("-- USDA PLANTS Database Import (Streamed Online)\nBEGIN;\n\n")
+        else:
+            sql_file.write("\n-- Resumed Import\nBEGIN;\n\n")
+
+    progress_log = None
+    if progress_file_path:
+        progress_file_path.parent.mkdir(parents=True, exist_ok=True)
+        progress_log = open(progress_file_path, "a", encoding="utf-8")
+
+    total = len(pending_taxa)
+    count = 0
+    success = 0
+    skipped = 0
+
+    try:
+        def task_fn(item: Tuple[str, str, str]) -> Tuple[str, Optional[PlantRecord]]:
+            sym = item[0]
+            rec = process_plant_online_in_memory(sym, resolver, delay=delay)
+            return sym, rec
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            taxa_iter = iter(pending_taxa)
+            futures: Dict[concurrent.futures.Future, Tuple[str, str, str]] = {}
+
+            # Prime the pool with bounded in-flight tasks
+            max_in_flight = max(workers * 4, 16)
+            for item in itertools.islice(taxa_iter, max_in_flight):
+                futures[executor.submit(task_fn, item)] = item
+
+            while futures:
+                done, _ = concurrent.futures.wait(
+                    futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    count += 1
+                    sym = futures[future][0]
+                    del futures[future]
+
+                    # Submit next item if available
+                    next_item = next(taxa_iter, None)
+                    if next_item:
+                        futures[executor.submit(task_fn, next_item)] = next_item
+
+                    try:
+                        _, record = future.result()
+                    except Exception as e:
+                        if verbose:
+                            sys.stderr.write(f"Error streaming {sym}: {e}\n")
+                        record = None
+
+                    if record:
+                        success += 1
+                        # 1. Output SQL
+                        if sql_file:
+                            append_plant_sql(sql_file, record)
+                            sql_file.flush()
+
+                        # 2. Direct DB execution if URL provided
+                        if db_url:
+                            plant_sql = io.StringIO()
+                            plant_sql.write("BEGIN;\n")
+                            append_plant_sql(plant_sql, record)
+                            plant_sql.write("COMMIT;\n")
+                            execute_sql_against_db(plant_sql.getvalue(), db_url)
+
+                        # 3. Real-time Supabase Edge Function / RPC execution
+                        if supabase_url and supabase_key:
+                            upsert_plant_to_supabase(
+                                record,
+                                supabase_url,
+                                supabase_key,
+                                use_edge_function=use_edge_function,
+                            )
+
+                        # Discard record from memory!
+                        del record
+                    else:
+                        skipped += 1
+
+                    # Record in progress file
+                    if progress_log:
+                        progress_log.write(f"{sym}\n")
+                        progress_log.flush()
+
+                    if verbose and (count % 25 == 0 or count == total):
+                        print(f"[{count}/{total}] {success} plants imported, {skipped} non-plants/varieties skipped.")
+
+    finally:
+        if sql_file:
+            sql_file.write("COMMIT;\n")
+            sql_file.close()
+            if verbose:
+                print(f"\nSQL script written to: {sql_out_path.resolve()}")
+        if progress_log:
+            progress_log.close()
+
+    print("\nStreaming import complete!")
+    print(f"Total processed: {count}")
+    print(f"Plants imported: {success}")
+    print(f"Skipped:        {skipped}")
+    print("Zero CSV files left on disk.")
+
+
 def collect_csv_files(paths: List[str]) -> List[Path]:
-    """Collects and deduplicates all CSV files from specified files, directories, or globs."""
+    """Collects and deduplicates CSV files from paths/globs."""
     collected: List[Path] = []
     for p_str in paths:
         path = Path(p_str)
@@ -874,8 +1269,7 @@ def collect_csv_files(paths: List[str]) -> List[Path]:
         else:
             parent = path.parent if str(path.parent) != "" else Path(".")
             pattern = path.name
-            matches = list(parent.glob(pattern))
-            for m in matches:
+            for m in list(parent.glob(pattern)):
                 if m.is_file() and m.suffix.lower() == ".csv":
                     collected.append(m)
 
@@ -889,14 +1283,13 @@ def collect_csv_files(paths: List[str]) -> List[Path]:
     return result
 
 
-def process_csv_files(
+def process_local_csv_files(
     csv_files: List[Path],
     resolver: PlantMetadataResolver,
+    delete_after: bool = False,
     verbose: bool = False,
 ) -> List[PlantRecord]:
-    """
-    Processes all CSV files, resolves plant metadata, and groups plant records.
-    """
+    """Processes local CSV files, optionally deleting each file after parsing."""
     plants_by_key: Dict[Tuple[str, str], PlantRecord] = {}
     skipped_varieties = 0
     skipped_no_identity = 0
@@ -905,7 +1298,7 @@ def process_csv_files(
         if verbose or idx % 50 == 0 or idx == len(csv_files):
             print(f"[{idx}/{len(csv_files)}] Parsing {csv_path.name}...")
 
-        symbol, counties, direct_attrs = parse_csv_file(csv_path)
+        symbol, counties, direct_attrs = parse_csv_file(csv_path, delete_after=delete_after)
 
         if not symbol:
             base_name = csv_path.stem.split(".")[0].split("_")[0].split("(")[0].strip().upper()
@@ -919,19 +1312,7 @@ def process_csv_files(
 
         record = map_plant_attributes(symbol or "", profile, chars, direct_attrs)
         if not record:
-            raw_sci = direct_attrs.get("scientificname") or (profile.get("ScientificName") if profile else "")
-            raw_rank = direct_attrs.get("rank") or (profile.get("Rank") if profile else "")
-            if raw_sci and (
-                re.search(r"\b(var\.|ssp\.|subsp\.|subvar\.|f\.|forma)\b", raw_sci, re.IGNORECASE)
-                or (raw_rank and raw_rank.lower() in ("variety", "subspecies", "subtaxa"))
-            ):
-                skipped_varieties += 1
-                if verbose:
-                    print(f"  -> Skipped variety/subspecies: {raw_sci}")
-            else:
-                skipped_no_identity += 1
-                if verbose:
-                    print(f"  -> Skipped (could not determine species or excluded taxon): {csv_path.name}")
+            skipped_varieties += 1
             continue
 
         key = (record.genus, record.species)
@@ -967,25 +1348,50 @@ def process_csv_files(
 
     print("\n--- Summary ---")
     print(f"CSV files processed:        {len(csv_files)}")
+    if delete_after:
+        print(f"CSV files deleted from disk:{len(csv_files)}")
     print(f"Distinct plants extracted:   {len(records)}")
     print(f"  Standard species:          {len(records) - total_hybrids}")
     print(f"  Hybrids formatted ('x '):  {total_hybrids}")
     print(f"Varieties/subspecies skipped:{skipped_varieties}")
-    print(f"Other unparsed/skipped files:{skipped_no_identity}")
     print(f"Unique counties resolved:    {total_unique_counties}")
     print(f"Total plant-county relations:{total_counties}")
 
     return records
 
 
+# Backwards compatibility alias
+process_csv_files = process_local_csv_files
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Import USDA PLANTS download data CSV files into Postgres database."
+        description="Import USDA PLANTS data into Postgres database with zero or minimal disk usage."
     )
     parser.add_argument(
         "inputs",
-        nargs="+",
-        help="CSV file paths, directories, or glob patterns to import.",
+        nargs="*",
+        help="Optional local CSV file paths or directories. If omitted or --stream is used, reads from online.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream mode: reads each CSV directly from online into memory and discards it. Zero CSVs on disk!",
+    )
+    parser.add_argument(
+        "--checklist",
+        default="plantlst.txt",
+        help="Path or URL to USDA checklist plantlst.txt (default: plantlst.txt).",
+    )
+    parser.add_argument(
+        "--symbols",
+        help="Comma-separated symbols to process (e.g. SOCA6,ACSA3,POXCA).",
+    )
+    parser.add_argument(
+        "--limit",
+        "-n",
+        type=int,
+        help="Limit number of plants to process (useful for testing, e.g. --limit 50).",
     )
     parser.add_argument(
         "--sql-out",
@@ -999,6 +1405,29 @@ def main() -> None:
         help="PostgreSQL connection URL (e.g. postgresql://user:pass@host:5432/db).",
     )
     parser.add_argument(
+        "--delete-after",
+        action="store_true",
+        help="In local file mode: delete each CSV file immediately after reading it to save storage.",
+    )
+    parser.add_argument(
+        "--progress-file",
+        default=DEFAULT_PROGRESS_FILE,
+        help="File to record completed symbols for resuming (default: import_progress.txt).",
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=4,
+        help="Number of concurrent worker threads (default: 4).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.05,
+        help="Delay in seconds between requests per thread (default: 0.05).",
+    )
+    parser.add_argument(
         "--metadata",
         dest="metadata_file",
         help="Optional local JSON file containing plant profiles/characteristics for offline resolution.",
@@ -1006,8 +1435,8 @@ def main() -> None:
     parser.add_argument(
         "--cache-dir",
         dest="cache_dir",
-        default=DEFAULT_CACHE_DIR,
-        help="Directory to cache USDA API responses (default: .usda_cache).",
+        default=None,
+        help="Optional directory to cache USDA API responses.",
     )
     parser.add_argument(
         "--offline",
@@ -1015,9 +1444,19 @@ def main() -> None:
         help="Offline mode: do not attempt to contact the USDA PLANTS API.",
     )
     parser.add_argument(
-        "--dry-run",
+        "--supabase-url",
+        default=os.environ.get("SUPABASE_URL"),
+        help="Supabase Project URL (e.g. https://xyz.supabase.co), defaults to SUPABASE_URL env var.",
+    )
+    parser.add_argument(
+        "--supabase-key",
+        default=os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
+        help="Supabase service_role secret key for real-time DB edit access, defaults to SUPABASE_SERVICE_ROLE_KEY env var.",
+    )
+    parser.add_argument(
+        "--use-rpc",
         action="store_true",
-        help="Parse and validate CSV files without outputting SQL or modifying the database.",
+        help="Call PostgREST RPC directly instead of the Edge Function.",
     )
     parser.add_argument(
         "--verbose",
@@ -1028,22 +1467,56 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    csv_files = collect_csv_files(args.inputs)
-    if not csv_files:
-        print("No CSV files found matching inputs.")
-        sys.exit(1)
-
     resolver = PlantMetadataResolver(
         offline=args.offline,
         cache_dir=args.cache_dir,
         metadata_file=args.metadata_file,
     )
 
-    records = process_csv_files(csv_files, resolver, verbose=args.verbose)
+    # 1. Stream Mode (Reads from online, parses in-memory, discards CSV)
+    if args.stream or not args.inputs:
+        if args.symbols:
+            symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            taxa_list = [(s, s, "") for s in symbols]
+            if args.limit:
+                taxa_list = taxa_list[: args.limit]
+        else:
+            taxa_list = fetch_accepted_checklist(
+                checklist_path_or_url=args.checklist,
+                limit=args.limit,
+                verbose=True,
+            )
 
-    if args.dry_run:
-        print("Dry run complete. No database changes made.")
+        sql_out_path = Path(args.sql_out) if args.sql_out else None
+        progress_path = Path(args.progress_file) if args.progress_file else None
+
+        stream_online_import(
+            taxa_list=taxa_list,
+            resolver=resolver,
+            sql_out_path=sql_out_path,
+            db_url=args.db_url,
+            progress_file_path=progress_path,
+            workers=args.workers,
+            delay=args.delay,
+            verbose=args.verbose or True,
+            supabase_url=args.supabase_url,
+            supabase_key=args.supabase_key,
+            use_edge_function=not args.use_rpc,
+        )
         return
+
+    # 2. Local File Mode
+    csv_files = collect_csv_files(args.inputs)
+    if not csv_files:
+        print("No CSV files found matching inputs.")
+        sys.exit(1)
+
+    records = process_local_csv_files(
+        csv_files=csv_files,
+        resolver=resolver,
+        delete_after=args.delete_after,
+        verbose=args.verbose,
+    )
 
     sql_content = generate_sql(records)
 
