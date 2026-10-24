@@ -15,7 +15,7 @@ test('upsert_plant RPC correctly inserts and updates plants, counties, and commo
     '202610240003_public_search.sql',
     '202610240004_rpc_only_public_search.sql',
     '202610240005_name_search_ids.sql',
-    '202610240006_upsert_plant.sql',
+    '20261024000601_upsert_plant.sql',
   ];
 
   for (const file of migrationFiles) {

@@ -1,5 +1,10 @@
 # Plant search
 
+MOBOT enrichment tooling and its collection/prepare/apply workflow are documented
+in [scripts/MOBOT.md](scripts/MOBOT.md). Wait until the current USDA import finishes
+before applying its schema migration: it changes stored measurements to inches
+and changes `water` from a single enum to an enum array.
+
 ## Plant details
 
 `GET /functions/v1/plant-details?plantId=6` returns one JSON object containing all
@@ -88,20 +93,23 @@ npx supabase functions serve plant-counties
 
 Search is a case-insensitive literal substring of `genus species` or any common
 name linked through `common_plant` and `common_names`. Results contain unique IDs
-in ascending order. No matches return `[]`. All matching IDs are returned, without
-pagination, counts, or plant fields.
+in ascending order. No matches return `[]`. Each response contains one page of
+IDs (default 50, maximum 100), without counts or plant fields. Use
+`?search=milkweed&page=2&pageSize=50` for another page. An empty page means there
+are no further IDs at that offset.
 
 The optional `search` parameter accepts up to 200 characters after trimming and
-whitespace normalization. Omitting it searches all plants. Optional filters:
+whitespace normalization. Omitting it browses a bounded page of plants. Optional filters:
 
 | Parameter | Values |
 | --- | --- |
 | `lifeCycle` | `perennial`, `biennial`, `annual` |
 | `foliage` | `deciduous`, `evergreen` |
 | `sun` | `full sun`, `part shade`, `full shade` |
-| `water` | `high`, `med`, `low` |
+| `water` | `high`, `medium`, `low`; `med` is accepted as an alias for `medium` |
 | `isWoody`, `isTree`, `edible`, `thorns` | `true` or `false` |
 | `minHeight`, `maxHeight`, `minWidth`, `maxWidth` | Whole inches, 0–32767 |
+| `page`, `pageSize` | Default 1 and 50; maximum 1000 and 100 |
 
 Pass enum selections as comma-separated values, for example
 `?search=oak&lifeCycle=perennial,annual&isWoody=true&minHeight=12&maxHeight=72`.
@@ -136,7 +144,7 @@ responses allow short public caching.
 
 For an existing hosted project with the name search RPC:
 
-1. Run `supabase/migrations/202610240007_search_filters.sql` in the SQL Editor.
+1. Apply migration 008 (inches/water arrays), then `supabase/migrations/202610240009_search_water_pagination.sql`. The latter supersedes the earlier search-filter function. The MOBOT `prepare` command runs both 008 and 009 after taking a backup; do not run it until the current feet-based import has finished.
 2. Redeploy `search-plants`, including `index.ts`, `handler.ts`, and `query.ts`.
 3. Keep JWT verification off in the Dashboard (matching `config.toml`).
 
@@ -146,6 +154,26 @@ and numeric measurements in `p_filters`, for example
 `{"p_filters":{"search":"milkweed","lifeCycle":["perennial"],"minHeight":12}}`.
 
 No hosted migration or deployment is performed by editing these files.
+
+## USDA importer checkpoints
+
+The streaming importer records version-2 JSON events at the existing progress
+file path. Only confirmed writes to every configured database destination,
+durable SQL-only exports, and deliberate exclusions with recorded reasons are
+complete. Failed fetches, incomplete profile/characteristic/distribution requests,
+and failed writes remain retryable; the CLI exits nonzero when any retries remain.
+SQL exports commit and flush each plant before checkpointing.
+On resume, bytes after the last confirmed SQL checkpoint are saved to a
+`*.unconfirmed-*.bak` file and removed from the active export before retrying.
+If no matching checkpoint exists, the existing export is preserved in that backup
+and rebuilt from byte zero.
+
+Legacy plain-symbol progress entries cannot prove a write succeeded, so the new
+importer ignores them and retries those symbols. Preserve the old file for audit;
+do not assume it proves all data was imported. Database upserts are repeatable.
+Use a fresh SQL output path if an older export was interrupted inside a statement
+or transaction. Checkpoints are scoped to the configured destinations so an
+export or a write to another project cannot masquerade as a confirmed live write.
 
 ## Local development
 

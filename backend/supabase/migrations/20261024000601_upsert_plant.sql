@@ -145,5 +145,13 @@ $$;
 -- Revoke public access, grant execute to service_role and authenticated
 revoke execute on function public.upsert_plant(jsonb) from public, anon;
 revoke execute on function public.upsert_plants_batch(jsonb) from public, anon;
-grant execute on function public.upsert_plant(jsonb) to authenticated, service_role;
-grant execute on function public.upsert_plants_batch(jsonb) to authenticated, service_role;
+grant execute on function public.upsert_plant(jsonb) to authenticated;
+grant execute on function public.upsert_plants_batch(jsonb) to authenticated;
+
+do $$ begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.upsert_plant(jsonb) to service_role;
+    grant execute on function public.upsert_plants_batch(jsonb) to service_role;
+  end if;
+end $$;
+
