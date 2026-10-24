@@ -1,5 +1,55 @@
 # Plant name search
 
+## County lookup
+
+`POST /functions/v1/plant-counties` accepts a JSON body:
+
+```json
+{"plantIds":[12,45,81,12]}
+```
+
+The response is an array of county-FIPS arrays, one per input position:
+
+```json
+[[12069,12095],[51059],[],[12069,12095]]
+```
+
+Input order and duplicate IDs are preserved. FIPS codes in each list are sorted
+numerically. Missing plants and plants without county records return `[]` at
+their position. Empty input returns `[]`. Send up to 1000 positive 32-bit integer
+IDs, with a JSON body no larger than 16 KiB. No user login is needed; send the
+publishable key in `apikey`, and keep JWT verification off for this function.
+
+Like `search-plants`, this endpoint applies a best-effort limit of 120 POST
+requests per 60-second window per forwarded client IP in each Edge runtime.
+Excess requests return 429 and `Retry-After: 60` before reading the body or calling
+the database. Preflight requests are exempt. Counters are bounded to 5000 IPs and
+reset when the runtime restarts. This is not a distributed limit: missing or
+spoofed forwarding headers, multiple runtimes, and direct RPC calls can bypass it.
+
+```js
+const response = await fetch(`${supabaseUrl}/functions/v1/plant-counties`, {
+  method: 'POST',
+  headers: { apikey: publishableKey, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ plantIds: [12, 45, 81] })
+});
+if (!response.ok) throw new Error((await response.json()).error ?? 'County lookup failed');
+const countiesByPlant = await response.json();
+```
+
+For hosted deployment, run `202610240006_plant_counties.sql` in the SQL Editor,
+then deploy the `plant-counties` directory (`index.ts`, `handler.ts`, `input.ts`).
+The migration uses the existing `plant_county` table and grants only RPC execution;
+it does not grant anonymous table access. It can also be applied to an existing
+matching schema independently of the search migrations. To serve locally:
+
+```sh
+npx supabase migration up --local
+npx supabase functions serve plant-counties
+```
+
+## Name lookup
+
 `GET /functions/v1/search-plants?search=milkweed` returns only matching plant IDs:
 
 ```json
