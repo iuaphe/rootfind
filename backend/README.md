@@ -165,6 +165,73 @@ For a new database, the migration chain creates the supplied plant, county, and
 common-name tables, with INTEGER FIPS columns. Do not run the initial CREATE TABLE
 migration against an existing schema without reconciling it first.
 
+## Local SQL backups
+
+With Docker Desktop running and `npm ci` completed, export the linked hosted
+database from `backend/`:
+
+```sh
+npm run db:dump
+```
+
+The script uses the installed, lockfile-pinned CLI through
+`npx --no-install supabase db dump`. The CLI creates disposable Supabase Postgres
+containers to run `pg_dump` against the live source database. A separate local
+database server is not required for hosted exports, and the source is only read.
+Use `npx supabase login` and `npx supabase link --project-ref YOUR_PROJECT_REF`
+first if this checkout is not already linked. The CLI uses its saved credentials;
+`SUPABASE_DB_PASSWORD` can supply the database password when needed. To export a
+different database, set `SUPABASE_DB_URL` to its percent-encoded PostgreSQL
+connection string (use the session pooler on IPv4-only networks).
+
+Each successful run writes a new `backups/rootfind-<timestamp>-<suffix>/` containing
+`roles.sql`, `schema.sql`, `data.sql`, and a combined **`rootfind.sql`**. Dumps are
+ignored by Git and created with private file permissions. Failed exports do not
+publish a completed backup. Roles, schema, and data are exported separately, so
+avoid schema changes while a backup runs; this is not a single coordinated
+snapshot across all three commands.
+
+To export an existing local Supabase database instead:
+
+```sh
+npx supabase db start
+npm run db:dump -- --local
+```
+
+Restore the combined file into a **fresh Supabase database** with its built-in
+roles and managed schemas already initialized (not an empty vanilla Postgres
+server). With `psql` available and `LOCAL_DB_URL` pointing to that fresh target
+using an administrator role able to restore role settings and parameter grants:
+
+```sh
+psql "$LOCAL_DB_URL" --single-transaction --variable ON_ERROR_STOP=1 \
+  --file backups/rootfind-<timestamp>-<suffix>/rootfind.sql
+```
+
+The local copy created during setup uses the isolated project at `backups/local`,
+container `supabase_db_rootfind-backup`, and Postgres port **15432**. Restore into
+that container with its `supabase_admin` role:
+
+```sh
+docker exec -i supabase_db_rootfind-backup psql -U supabase_admin -d postgres \
+  --single-transaction --variable ON_ERROR_STOP=1 \
+  < backups/rootfind-<timestamp>-<suffix>/rootfind.sql
+```
+
+Run a restore only against a fresh target; the copy already contains the restored
+tables. To stop or resume this local database without removing its saved data:
+
+```sh
+npx supabase stop --workdir backups/local
+npx supabase db start --workdir backups/local
+```
+
+The backup follows [Supabase's CLI backup workflow](https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore).
+The CLI omits Supabase-managed schema definitions and migration history by default;
+custom changes inside managed schemas need separate handling. Storage file
+contents, Edge Function code, and project settings are not included. Vector
+bucket/index metadata is excluded as recommended by Supabase.
+
 ## Tests
 
 From `backend/`, with Node 24+:

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "db:dump": "node scripts/dump_db.mjs",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "scrape-usda": "python3 scripts/scrape_usda.py",
     "import-usda": "python3 scripts/import_usda.py"

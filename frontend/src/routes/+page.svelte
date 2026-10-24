@@ -2,6 +2,8 @@
 	import { Map, type CountyColorAssignment, type CountyFeature, type CountyProperties } from '#lib';
 	import { onMount } from 'svelte';
 	import RangeSlider from '#lib/components/RangeSlider.svelte';
+	import CountySidebar from '#lib/components/CountySidebar.svelte';
+	import { apiUrl, apikey, createPlantDetailsClient } from '#lib/plant-details.js';
 	import {
 		booleanFilters,
 		countFilters,
@@ -13,14 +15,20 @@
 		type EnumFilterKey
 	} from '#lib/plant-filters.js';
 
-	const apiUrl = 'https://mbvkjcluckluyjwscqkx.supabase.co/functions/v1';
-	const apikey = 'sb_publishable_oqsF0ARtDJ2Rw8Z5jNiCKw_L_NTANOF';
+	const getPlantDetails = createPlantDetailsClient();
 	let search = $state('carya');
 	let loading = $state(false);
 	let error = $state('');
 	let message = $state('');
-	let plantIds: number[] = [];
-	let g: number[][] = [];
+	let plantIds = $state.raw<number[]>([]);
+	let g = $state.raw<number[][]>([]);
+	let searched = $state(false);
+	let selectedCounty = $state.raw<CountyProperties | null>(null);
+	const countyPlantIds = $derived.by(() => {
+		if (!selectedCounty || !searched || loading || error) return null;
+		const countyId = Number(selectedCounty.geoid);
+		return plantIds.filter((_, i) => g[i]?.includes(countyId));
+	});
 	let assignment: CountyColorAssignment = $state(() => `#bbb`);
 	let controller: AbortController | undefined;
 	let filtersOpen = $state(false);
@@ -60,6 +68,7 @@
 		loading = true;
 		error = '';
 		message = `Searching ${description}…`;
+		searched = false;
 		plantIds = [];
 		g = [];
 		assignment = () => '#bbb';
@@ -76,6 +85,7 @@
 			}
 
 			if (ids.length === 0) {
+				searched = true;
 				message = `No plants found for ${description}. Try another name or adjust the filters.`;
 				return;
 			}
@@ -105,6 +115,7 @@
 
 			plantIds = ids;
 			g = counties;
+			searched = true;
 			const counts: Record<number, number> = {};
 			for (const countyIds of counties) {
 				for (const id of countyIds) counts[id] = (counts[id] ?? 0) + 1;
@@ -115,7 +126,7 @@
 				return `rgb(${amount}, 255, ${amount})`;
 			};
 			message = counties.some((countyIds) => countyIds.length > 0)
-				? `Showing ${ids.length.toLocaleString()} matching plant${ids.length === 1 ? '' : 's'} for ${description}. Greener counties have more matches.`
+				? `Showing ${ids.length.toLocaleString()} match${ids.length === 1 ? '' : 'es'}.`
 				: `No county records found for ${description}.`;
 		} catch (cause) {
 			if (!signal.aborted) {
@@ -134,15 +145,21 @@
 	});
 
 	const onClick = (c: CountyFeature) => {
-		alert(
-			`${c.properties.name}: ${plantIds.filter((x, i) => g[i]?.includes(parseInt(c.properties.geoid, 10))).join(', ') || 'No matching plants'}`
-		);
+		selectedCounty = c.properties;
 	};
+
+	function closeCounty() {
+		selectedCounty = null;
+		document.querySelector<HTMLCanvasElement>('.map-area canvas')?.focus();
+	}
 </script>
 
 <svelte:window
 	onkeydown={(event) => {
-		if (event.key === 'Escape' && filtersOpen) closeFilters();
+		if (event.key === 'Escape') {
+			if (filtersOpen) closeFilters();
+			else if (selectedCounty) closeCounty();
+		}
 	}}
 />
 
@@ -264,7 +281,23 @@
 		{/if}
 	</section>
 	<div class="map-area">
-		<Map height="100%" colorAssignment={assignment} onCountyClick={onClick} />
+		<div class="map-container">
+			<Map height="100%" colorAssignment={assignment} onCountyClick={onClick} />
+		</div>
+		{#if selectedCounty}
+			{#key selectedCounty.geoid}
+				{#key countyPlantIds}
+					<CountySidebar
+						county={selectedCounty}
+						plantIds={countyPlantIds}
+						searching={loading}
+						searchError={error}
+						{getPlantDetails}
+						onclose={closeCounty}
+					/>
+				{/key}
+			{/key}
+		{/if}
 	</div>
 </main>
 
@@ -277,8 +310,14 @@
 		color: #254d46;
 	}
 	.map-area {
+		position: relative;
+		display: flex;
 		flex: 1;
-		min-height: 320px;
+		min-height: 0;
+	}
+	.map-container {
+		flex: 1;
+		min-width: 0;
 	}
 	.search-panel {
 		position: relative;
