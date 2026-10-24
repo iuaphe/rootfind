@@ -24,26 +24,36 @@ test('search punctuation stays literal data', () => {
 });
 
 const settings = { url: 'https://example.supabase.co', anonKey: 'public-key' };
-test('forwards token and validated JSON, including empty pages and totals', async () => {
+test('public requests use anon credentials and validated JSON, including empty pages and totals', async () => {
   const payload = { data: [], total: 5, page: 3, pageSize: 25 };
   const handler = createHandler(settings, async (url, init) => {
     assert.equal(url, settings.url + '/rest/v1/rpc/search_plants');
-    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer caller-token');
+    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer public-key');
     assert.deepEqual(JSON.parse(init?.body as string), { p_filters: { page: 3, pageSize: 25, edible: false } });
     return Response.json(payload);
   });
-  const result = await handler(new Request('https://edge.test/?page=3&edible=false', { headers: { Authorization: 'Bearer caller-token' } }));
+  const result = await handler(new Request('https://edge.test/?page=3&edible=false'));
   assert.equal(result.status, 200);
   assert.deepEqual(await result.json(), payload);
   assert.equal(result.headers.get('Access-Control-Allow-Origin'), '*');
+  assert.equal(result.headers.get('Cache-Control'), 'public, max-age=30, s-maxage=60');
 });
 
-test('preflight, method, auth, and invalid query fail before database access', async () => {
+test('caller credentials cannot elevate public search privileges', async () => {
+  const handler = createHandler(settings, async (_url, init) => {
+    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer public-key');
+    return Response.json({ data: [], total: 0 });
+  });
+  assert.equal((await handler(new Request('https://edge.test', {
+    headers: { Authorization: 'Bearer caller-token', apikey: 'caller-key' },
+  }))).status, 200);
+});
+
+test('preflight, method, and invalid query fail before database access', async () => {
   const handler = createHandler(settings, async () => { throw new Error('Must not fetch'); });
   assert.equal((await handler(new Request('https://edge.test', { method: 'OPTIONS' }))).status, 204);
   assert.equal((await handler(new Request('https://edge.test', { method: 'POST' }))).status, 405);
-  assert.equal((await handler(new Request('https://edge.test'))).status, 401);
-  assert.equal((await handler(new Request('https://edge.test/?edible=maybe', { headers: { Authorization: 'Bearer x' } }))).status, 400);
+  assert.equal((await handler(new Request('https://edge.test/?edible=maybe'))).status, 400);
 });
 
 test('database errors are sanitized', async () => {
