@@ -25,5 +25,8 @@ port = 15427
 [functions.search-plants]
 verify_jwt = false
 
+[functions.upsert-plant]
+verify_jwt = false
+
 [functions.plant-counties]
 verify_jwt = false
