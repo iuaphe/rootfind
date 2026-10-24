@@ -8,7 +8,7 @@ test('migrations and search execute against Postgres with common-name relationsh
   try {
     // Supabase normally supplies these roles.
     await db.exec('create role anon; create role authenticated;');
-    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql']) {
+    for (const file of ['202610240001_plants.sql', '202610240002_search_plants.sql', '202610240003_public_search.sql', '202610240004_rpc_only_public_search.sql']) {
       await db.exec(await readFile(new URL(`../supabase/migrations/${file}`, import.meta.url), 'utf8'));
     }
     await db.exec(`
@@ -47,7 +47,21 @@ test('migrations and search execute against Postgres with common-name relationsh
     await db.exec('reset role; delete from public.common_names where name = \'Butterfly weed\'; set role authenticated;');
     assert.equal((await search({ search: 'Butterfly weed' })).total, 0, 'deleted aliases cascade');
     await db.exec('reset role; set role anon;');
-    await assert.rejects(search({ search: 'milkweed' }), /permission denied/);
+    assert.equal((await search({ search: 'milkweed', county: ['51059'] })).total, 1);
+    for (const table of ['plants', 'county_info', 'plant_county', 'common_names', 'common_plant']) {
+      await assert.rejects(db.query(`select * from public.${table}`), /permission denied/);
+    }
+    // Supabase may grant write privileges by default; RLS must still deny writes.
+    await db.exec(`reset role;
+      grant select, insert, update, delete on public.plants, public.county_info, public.plant_county,
+        public.common_names, public.common_plant to anon;
+      set role anon;`);
+    for (const table of ['plants', 'county_info', 'plant_county', 'common_names', 'common_plant']) {
+      const column = table === 'county_info' || table === 'plant_county' ? 'fips' : table === 'common_names' || table === 'common_plant' ? 'name' : 'genus';
+      assert.equal((await db.query(`update public.${table} set ${column} = ${column} returning *`)).rows.length, 0);
+      assert.equal((await db.query(`delete from public.${table} returning *`)).rows.length, 0);
+    }
+    await assert.rejects(db.exec("insert into public.common_names values ('Unauthorized alias')"), /row-level security/);
   } finally {
     await db.close();
   }

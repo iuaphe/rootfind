@@ -1,4 +1,26 @@
 project_id = "rootfind"
 
+# Avoid Windows/Hyper-V reserved ports around the default 5432x range.
+[api]
+port = 15421
+
+[db]
+port = 15422
+shadow_port = 15420
+
+[db.pooler]
+port = 15429
+
+[studio]
+port = 15423
+
+[inbucket]
+port = 15424
+smtp_port = 15425
+pop3_port = 15426
+
+[analytics]
+port = 15427
+
 [functions.search-plants]
-verify_jwt = true
+verify_jwt = false

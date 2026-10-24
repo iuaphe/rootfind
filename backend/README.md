@@ -17,16 +17,24 @@ No database has been changed or function deployed by adding these files.
   Unknown properties are SQL NULL, not false. Filtering excludes unknown values.
 - Height and width units are not yet decided. Use one consistent unit for data
   and requests. The API accepts whole numbers from 0 to 32767.
-- Only signed-in users can read these tables or call the search RPC. RLS remains
-  active because the SQL function uses SECURITY INVOKER and the Edge Function
-  forwards the caller's token. No service-role key is used.
+- Search is public: no login or user Authorization token is needed. The frontend
+  should still send the project's publishable key in the `apikey` header. The
+  function uses its built-in anon key for database requests. Anonymous clients can
+  execute the search RPC but cannot query catalog tables directly. The RPC is
+  SECURITY DEFINER with a fixed empty search path and static, read-only SQL; no
+  service-role key is used.
+- The endpoint applies a best-effort per-runtime limit of 120 requests per minute
+  per forwarded client IP and allows short public response caching. This is a
+  lightweight MVP guard, not a distributed abuse-prevention system; direct calls
+  to the public RPC can bypass the Edge Function's rate limit.
 - The initial migrations create new tables; reconcile them before applying to an
   existing database. The frontend's sample Drizzle `task` table is unrelated.
   These local migrations have not been deployed. If the supplied tables already
-  exist, do not rerun the initial CREATE TABLE migration: ensure the authenticated
-  SELECT grants and RLS policies cover all five tables, then apply the search
-  function definition. Existing smallint FIPS columns must be widened to integer
-  in both county tables before importing codes above 32767.
+  exist, do not rerun the initial CREATE TABLE migration. Apply the search function
+  and public RPC migrations, ensuring the function is SECURITY DEFINER with a
+  fixed empty search path and anonymous table grants/policies are removed. Existing
+  smallint FIPS columns must be widened to integer in both county tables before
+  importing codes above 32767.
 
 ## Request contract
 
@@ -61,7 +69,7 @@ const params = new URLSearchParams({ search: 'milkweed', thorns: 'false' });
 params.append('county', '12095');
 const response = await fetch(
   `${supabaseUrl}/functions/v1/search-plants?${params}`,
-  { headers: { apikey: publishableKey, Authorization: `Bearer ${session.access_token}` } }
+  { headers: { apikey: publishableKey } }
 );
 if (!response.ok) throw new Error((await response.json()).error ?? 'Search failed');
 const { data, total, page, pageSize } = await response.json();
@@ -79,8 +87,25 @@ supabase functions serve search-plants
 ```
 
 `db reset` rebuilds the local development database and erases its local data.
-Supabase supplies `SUPABASE_URL` and `SUPABASE_ANON_KEY` to the function.
-Send a signed-in user's access token in `Authorization`.
+Supabase supplies `SUPABASE_URL` and `SUPABASE_ANON_KEY` to the function. The
+public endpoint does not require a user token; send the public publishable key in
+the frontend `apikey` header. For Dashboard deployment,
+turn off JWT verification for `search-plants`, matching `verify_jwt = false` in config.
+For an existing local database, apply the new public access migration without a reset:
+
+```sh
+npx supabase migration up --local
+```
+
+Restart `functions serve` after changing JWT verification. For existing hosted
+tables and search RPC, apply `202610240004_rpc_only_public_search.sql` in the SQL
+Editor. It removes anonymous table access and keeps public results available via
+the read-only search RPC.
+
+The checked-in config avoids Windows reserved ports in the default 5432x range:
+API/functions use `http://127.0.0.1:15421`, Studio uses
+`http://127.0.0.1:15423`, and Postgres uses port `15422`.
+Run `npx supabase status` for the current endpoints and keys.
 
 To apply to a selected hosted project after reviewing the provisional schema:
 
@@ -99,8 +124,9 @@ npm test
 ```
 
 Tests cover validation and the HTTP handler with a mocked database API, and run
-both SQL migrations in PGlite (embedded Postgres), including common-name aliases,
-scientific names, enum filters, county joins, pagination, and access permissions.
+all SQL migrations in PGlite (embedded Postgres), including common-name aliases,
+scientific names, enum filters, county joins, pagination, anonymous RPC access,
+denial of direct table reads, and denial of public writes.
 This does not replace a Supabase Edge runtime check. From the repository root,
 with Deno installed:
 

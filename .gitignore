@@ -1,4 +1,6 @@
 node_modules
+backend/supabase/.temp/
+backend/supabase/.branches/
 
 # Output
 .output

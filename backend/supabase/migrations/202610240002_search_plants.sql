@@ -1,7 +1,7 @@
 -- Static SQL and typed casts: search text never becomes executable SQL.
 create or replace function public.search_plants(p_filters jsonb default '{}')
 returns jsonb
-language sql stable security invoker
+language sql stable security definer
 set search_path = ''
 as $$
   with matched as materialized (
