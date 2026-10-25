@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from html.parser import HTMLParser
 from pathlib import Path
 import re
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -262,6 +263,43 @@ class Source:
     def __init__(self, name):
         self.name = name
         self.base_url = 'https://plants.ces.ncsu.edu' if name == 'ncstate' else 'https://pfaf.org'
+        self._known_slugs = None
+
+    def get_known_slugs(self, fetcher=None):
+        if self.name != 'ncstate':
+            return None
+        if self._known_slugs is not None:
+            return self._known_slugs
+        cache_file = None
+        directory = getattr(fetcher, 'directory', None)
+        if isinstance(directory, Path):
+            cache_file = directory / 'sitemap_slugs.txt'
+            if cache_file.exists():
+                try:
+                    self._known_slugs = set(filter(None, cache_file.read_text(encoding='utf-8').splitlines()))
+                    return self._known_slugs
+                except Exception:
+                    pass
+        try:
+            sitemap_url = self.base_url + '/sitemap.xml'
+            req = urllib.request.Request(sitemap_url, headers={'User-Agent': 'RootfindPlantEnrichment/1.0'})
+            ctx = getattr(fetcher, 'tls_context', None)
+            if not isinstance(ctx, ssl.SSLContext):
+                ctx = None
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                content = resp.read().decode('utf-8', errors='replace')
+            slugs = set(re.findall(r'<loc>https://plants\.ces\.ncsu\.edu/plants/([^/]+)/</loc>', content))
+            if slugs:
+                self._known_slugs = slugs
+                if cache_file:
+                    try:
+                        cache_file.write_text('\n'.join(sorted(slugs)), encoding='utf-8')
+                    except Exception:
+                        pass
+                return self._known_slugs
+        except Exception:
+            pass
+        return None
 
     def validate_snapshot(self, snapshot):
         columns = {column['column_name']: column['udt_name'] for column in snapshot['schema']['columns']}
@@ -276,6 +314,11 @@ class Source:
 
     def lookup(self, name, fetcher):
         url = self.profile_url(name)
+        if self.name == 'ncstate':
+            known = self.get_known_slugs(fetcher)
+            slug = re.sub(r'\s+', '-', name.replace('×', 'x').lower())
+            if known is not None and slug not in known:
+                return dict(search_url=url, source_url=url, status='no_match')
         parser = parse_ncstate if self.name == 'ncstate' else parse_pfaf
         record = dict(search_url=url, source_url=url)
         try:
@@ -316,14 +359,21 @@ def main(argv=None):
     parser.add_argument('--retry', action='store_true')
     parser.add_argument('--apply-live', action='store_true')
     args = parser.parse_args(argv)
-    if not 1 <= args.workers <= 8 or args.delay < 1 or (args.limit is not None and args.limit < 1):
-        parser.error('workers must be 1–8, delay at least 1, and limit positive')
+    if not 1 <= args.workers <= 16 or args.delay < 0 or (args.limit is not None and args.limit < 1):
+        parser.error('workers must be 1–16, delay non-negative, and limit positive')
     if args.apply_live and args.command != 'collect':
         parser.error('--apply-live requires collect')
     args.directory = (args.directory or core.BACKEND / '.enrichment' / args.source).resolve()
     args.source_adapter = Source(args.source)
     db = core.Database(args.directory, args.project_ref)
     if args.command == 'collect':
+        if args.source == 'ncstate':
+            fetcher_dir = args.directory / 'cache'
+            fetcher_dir.mkdir(parents=True, exist_ok=True)
+            mock_fetcher = core.Fetcher(fetcher_dir, args.delay, args.source_adapter.base_url)
+            slugs = args.source_adapter.get_known_slugs(mock_fetcher)
+            if slugs:
+                print(f'Indexed {len(slugs)} NC State profiles from sitemap. Non-matching catalog entries will be skipped without HTTP requests.', flush=True)
         core.collect(db, args)
     else:
         snapshot = db.snapshot('before-apply')
