@@ -9,7 +9,7 @@ export interface PlantDetails {
 	life_cycle?: string | null;
 	foliage?: string | null;
 	sun?: string | null;
-	water?: string | null;
+	water?: string | string[] | null;
 	minheight?: number | null;
 	maxheight?: number | null;
 	minwidth?: number | null;

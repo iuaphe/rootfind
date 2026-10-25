@@ -33,3 +33,6 @@ verify_jwt = false
 
 [functions.plant-details]
 verify_jwt = false
+
+[functions.count-plants-by-county]
+verify_jwt = false

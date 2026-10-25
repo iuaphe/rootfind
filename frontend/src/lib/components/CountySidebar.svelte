@@ -2,17 +2,20 @@
 	import { onMount } from 'svelte';
 	import type { CountyProperties } from '../types/counties';
 	import type { PlantDetails } from '../plant-details';
+	import { COUNTY_PAGE_SIZE, getCountyPlantIds } from '../plant-search.js';
 
 	let {
 		county,
-		plantIds,
+		query,
+		matchCount,
 		searching,
 		searchError,
 		getPlantDetails,
 		onclose
 	}: {
 		county: CountyProperties;
-		plantIds: number[] | null;
+		query: string | null;
+		matchCount: number;
 		searching: boolean;
 		searchError: string;
 		getPlantDetails: (id: number, signal: AbortSignal) => Promise<PlantDetails>;
@@ -22,22 +25,34 @@
 	let plants = $state<PlantDetails[]>([]);
 	let loading = $state(false);
 	let error = $state('');
+	let pendingIds = $state<number[]>([]);
+	let nextPage = 1;
+	let hasMore = $state(true);
 	const controller = new AbortController();
 
 	onMount(() => {
-		void load(plantIds, getPlantDetails, controller.signal);
+		if (query !== null && matchCount > 0) void load();
 		return () => controller.abort();
 	});
 
-	async function load(ids: number[] | null, lookup: typeof getPlantDetails, signal: AbortSignal) {
-		plants = [];
+	async function load() {
+		if (loading || query === null || controller.signal.aborted) return;
+		const { signal } = controller;
 		error = '';
-		loading = !!ids?.length;
+		loading = true;
 		try {
-			for (const id of ids ?? []) {
-				const plant = await lookup(id, signal);
+			if (!pendingIds.length) {
+				const ids = await getCountyPlantIds(query, county.geoid, nextPage, signal);
+				if (signal.aborted) return;
+				pendingIds = ids.filter((id) => !plants.some((plant) => plant.plant_id === id));
+				nextPage++;
+				hasMore = ids.length === COUNTY_PAGE_SIZE && plants.length + pendingIds.length < matchCount;
+			}
+			while (pendingIds.length) {
+				const plant = await getPlantDetails(pendingIds[0], signal);
 				if (signal.aborted) return;
 				plants.push(plant);
+				pendingIds = pendingIds.slice(1);
 			}
 		} catch (cause) {
 			if (!signal.aborted)
@@ -57,6 +72,11 @@
 
 	function trait(value: boolean | null | undefined) {
 		return value == null ? 'Unknown' : value ? 'Yes' : 'No';
+	}
+
+	function waterLevels(value: PlantDetails['water']) {
+		const levels = Array.isArray(value) ? value : value ? [value] : [];
+		return levels.map((level) => (level === 'med' ? 'medium' : level)).join(', ') || 'Unknown';
 	}
 
 	function imageUrl(value: string | null | undefined) {
@@ -89,11 +109,11 @@
 			<p role="status">Searching for matching species…</p>
 		{:else if searchError}
 			<p role="status">Run a successful search to see matching species in this county.</p>
-		{:else if plantIds === null}
+		{:else if query === null}
 			<p role="status">Search for plants to see matching species in this county.</p>
 		{:else}
-			<p class="summary">{plantIds.length.toLocaleString()} matching species in this county</p>
-			{#if plantIds.length === 0}
+			<p class="summary">{matchCount.toLocaleString()} matching species in this county</p>
+			{#if matchCount === 0}
 				<p role="status">
 					No species match your search and filters in this county. Try another search or adjust the
 					filters.
@@ -101,20 +121,16 @@
 			{/if}
 			{#if loading}
 				<p role="status">
-					Loading species details… {plants.length.toLocaleString()} of {plantIds.length.toLocaleString()}
+					Loading matching plants… {plants.length.toLocaleString()} of {matchCount.toLocaleString()}
 				</p>
 			{/if}
 			{#if error}
 				<div class="error" role="alert">
 					<p>{error}</p>
 					<p>
-						Showing {plants.length.toLocaleString()} of {plantIds.length.toLocaleString()} species.
+						Showing {plants.length.toLocaleString()} of {matchCount.toLocaleString()} species.
 					</p>
-					<button
-						type="button"
-						onclick={() => void load(plantIds, getPlantDetails, controller.signal)}
-						>Retry loading details</button
-					>
+					<button type="button" onclick={() => void load()}>Retry loading plants</button>
 				</div>
 			{/if}
 			<ul aria-label="Matching species">
@@ -153,7 +169,7 @@
 								</div>
 								<div>
 									<dt>Water</dt>
-									<dd>{plant.water === 'med' ? 'Medium' : (plant.water ?? 'Unknown')}</dd>
+									<dd>{waterLevels(plant.water)}</dd>
 								</div>
 								<div>
 									<dt>Height</dt>
@@ -185,6 +201,16 @@
 					</li>
 				{/each}
 			</ul>
+			{#if !loading && !error && plants.length > 0}
+				<p class="page-status">
+					Showing {plants.length.toLocaleString()} of {matchCount.toLocaleString()} species.
+				</p>
+				{#if hasMore}
+					<button type="button" onclick={() => void load()}>Load more species</button>
+				{/if}
+			{:else if !loading && !error && matchCount > 0}
+				<p role="status">These results have changed. Search again to refresh the county counts.</p>
+			{/if}
 		{/if}
 	</div>
 </aside>
@@ -247,6 +273,9 @@
 	.summary {
 		font-weight: 600;
 		margin-bottom: 12px;
+	}
+	.page-status {
+		margin: 16px 0 12px;
 	}
 	ul {
 		list-style: none;

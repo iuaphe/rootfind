@@ -68,7 +68,8 @@ export function createHandler(settings: Settings, fetcher: typeof fetch = fetch)
         signal: AbortSignal.timeout(10000),
       });
       if (!result.ok) {
-        console.error('search_plants RPC failed', result.status);
+        const failure = await result.json().catch(() => null);
+        console.error('search_plants RPC failed', result.status, failure?.code ?? 'unknown');
         return json({ error: result.status === 401 || result.status === 403 ? 'Search access denied' : 'Plant search failed' },
           result.status === 401 || result.status === 403 ? result.status : 502);
       }
