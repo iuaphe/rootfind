@@ -47,6 +47,7 @@
 		"#lib/*": "./src/lib/*"
 	},
 	"dependencies": {
+		"@maplibre/maplibre-gl-style-spec": "^26.4.4",
 		"maplibre-gl": "^6.15.0",
 		"proj4": "^2.22.0"
 	}

@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import type { ExpressionSpecification, Map as MapLibreMap } from 'maplibre-gl';
+	import type { Map as MapLibreMap } from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
 	import countiesUrl from '../data/counties.geojson?url';
 	import type { CountyFeatureCollection } from '../types/counties';
 	import { MAP_BOUNDS, type MapProps } from './map';
 	import { COUNTY_PROJECTION, initializeCountyProjection } from './map-projection';
+	import { createCountyColorTransition } from './map-color-transition';
 
 	let {
 		colorAssignment = {},
@@ -25,6 +26,7 @@
 	let ready = $state(false);
 	let error = $state('');
 	let hoveredId: string | undefined;
+	let colorTransition: ReturnType<typeof createCountyColorTransition> | undefined;
 
 	function clearHover() {
 		if (hoveredId !== undefined && map?.getSource(SOURCE)) {
@@ -34,23 +36,22 @@
 		if (map) map.getCanvas().style.cursor = '';
 	}
 
-	// Updating colors only changes GPU paint; the boundary source stays loaded.
-	$effect(() => {
-		if (!ready || !map || !counties) return;
+	const countyColors = $derived.by(() => {
 		const colors: Record<string, string> = {};
-		for (const { properties } of counties.features) {
+		for (const { properties } of counties?.features ?? []) {
 			const color =
 				typeof colorAssignment === 'function'
 					? colorAssignment(properties)
 					: colorAssignment[properties.geoid];
-			if (color !== undefined) colors[properties.geoid] = color;
+			colors[properties.geoid] = color ?? defaultColor;
 		}
-		const expression: ExpressionSpecification = [
-			'to-color',
-			['get', ['get', 'geoid'], ['literal', colors]],
-			defaultColor
-		];
-		map.setPaintProperty(FILL, 'fill-color', expression);
+		return colors;
+	});
+
+	// Updating colors only changes GPU paint; the boundary source stays loaded.
+	$effect(() => {
+		if (!ready || !colorTransition) return;
+		colorTransition.set(countyColors, defaultColor);
 	});
 
 	onMount(() => {
@@ -119,8 +120,12 @@
 						id: FILL,
 						type: 'fill',
 						source: SOURCE,
-						paint: { 'fill-color': defaultColor }
+						paint: {
+							'fill-color': defaultColor,
+							'fill-color-transition': { duration: 0, delay: 0 }
+						}
 					});
+					colorTransition = createCountyColorTransition(current, FILL);
 					current.addLayer({
 						id: 'county-hover',
 						type: 'fill',
@@ -176,6 +181,7 @@
 			disposed = true;
 			abort.abort();
 			observer?.disconnect();
+			colorTransition?.destroy();
 			instance?.remove();
 		};
 	});
@@ -187,7 +193,12 @@
 	aria-label={ariaLabel}
 	aria-busy={!ready && !error}
 >
-	<div class="canvas" bind:this={container}></div>
+	<div
+		class="canvas"
+		{@attach (node) => {
+			container = node;
+		}}
+	></div>
 	{#if error}
 		<div class="message error" role="alert">{error}</div>
 	{:else if !ready}

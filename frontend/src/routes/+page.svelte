@@ -85,7 +85,7 @@
 		message = `Searching ${description}…`;
 		completedSearch = null;
 		countyCounts = {};
-		assignment = () => '#bbb';
+		assignment = () => '#fff';
 
 		try {
 			const counts = await getCountyCounts(params, signal);
