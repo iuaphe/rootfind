@@ -272,16 +272,16 @@
 		gap: 6px;
 		min-height: 49px;
 		padding: 6px 10px;
-		border: 1px solid #809c90;
+		border: 1px solid var(--border-strong);
 		border-radius: 6px;
-		background: #f7faf8;
+		background: var(--surface-raised);
 	}
 	.input-shell:focus-within {
-		outline: 2px solid #254d46;
+		outline: 2px solid var(--accent);
 		outline-offset: 2px;
 	}
 	.input-shell.invalid {
-		border-color: #922f2f;
+		border-color: var(--error);
 	}
 	input {
 		flex: 1;
@@ -298,10 +298,10 @@
 		gap: 6px;
 		max-width: 100%;
 		padding: 3px 4px 3px 9px;
-		border: 1px solid #a8c8b4;
+		border: 1px solid var(--border);
 		border-radius: 5px;
-		background: #e7f1e9;
-		color: #1c5038;
+		background: var(--accent-subtle);
+		color: var(--text);
 		font-size: 0.875rem;
 	}
 	.chip > span {
@@ -313,14 +313,17 @@
 		width: 28px;
 		height: 28px;
 		border-radius: 3px;
+		border-color: var(--border);
+		background: var(--surface-hover);
+		color: var(--text);
 		cursor: pointer;
 		font-size: 1.25rem;
 	}
 	.chip button:hover {
-		background: #d3e7d9;
+		background: var(--surface-hover);
 	}
 	button:focus-visible {
-		outline: 2px solid #254d46;
+		outline: 2px solid var(--accent);
 		outline-offset: 2px;
 	}
 	.dropdown {
@@ -331,10 +334,11 @@
 		z-index: 5;
 		max-height: min(360px, 50dvh);
 		overflow-y: auto;
-		border: 1px solid #cbd9d3;
+		border: 1px solid var(--border);
 		border-radius: 8px;
-		background: white;
-		box-shadow: 0 8px 24px #254d4626;
+		background: var(--surface-panel);
+		color: var(--text);
+		box-shadow: 0 8px 24px #000b;
 	}
 	ul {
 		margin: 0;
@@ -355,11 +359,11 @@
 	}
 	li button[aria-selected='true'],
 	li button:hover {
-		background: #e7f1e9;
+		background: var(--surface-hover);
 	}
 	small {
 		flex-shrink: 0;
-		color: #60776c;
+		color: var(--muted);
 		font-size: 0.75rem;
 	}
 	.scientific {
@@ -368,11 +372,11 @@
 	.dropdown p {
 		padding: 10px 14px;
 		font-size: 0.8125rem;
-		color: #60776c;
+		color: var(--muted);
 	}
 	.input-error {
 		margin-top: 6px;
-		color: #922f2f;
+		color: var(--error);
 		font-size: 0.8125rem;
 	}
 	@media (max-width: 600px) {

@@ -55,7 +55,7 @@
 		float: right;
 		font-size: 0.875rem;
 		font-weight: 400;
-		color: #47665b;
+		color: var(--muted);
 	}
 	.range {
 		position: relative;
@@ -71,10 +71,10 @@
 		border-radius: 4px;
 		background: linear-gradient(
 			to right,
-			#dce5df var(--start),
-			#326b50 var(--start),
-			#326b50 var(--end),
-			#dce5df var(--end)
+			#263833 var(--start),
+			var(--accent) var(--start),
+			var(--accent) var(--end),
+			#263833 var(--end)
 		);
 	}
 	input {
@@ -91,30 +91,30 @@
 		width: 20px;
 		height: 20px;
 		appearance: none;
-		border: 2px solid #326b50;
+		border: 2px solid var(--accent);
 		border-radius: 50%;
-		background: white;
+		background: var(--surface-raised);
 		cursor: ew-resize;
 		pointer-events: auto;
 	}
 	input::-moz-range-thumb {
 		width: 16px;
 		height: 16px;
-		border: 2px solid #326b50;
+		border: 2px solid var(--accent);
 		border-radius: 50%;
-		background: white;
+		background: var(--surface-raised);
 		cursor: ew-resize;
 		pointer-events: auto;
 	}
 	input:focus-visible {
-		outline: 2px solid #326b50;
+		outline: 2px solid var(--accent);
 		outline-offset: 3px;
 		border-radius: 4px;
 	}
 	.endpoints {
 		display: flex;
 		justify-content: space-between;
-		color: #60776c;
+		color: var(--muted);
 		font-size: 0.75rem;
 	}
 </style>
