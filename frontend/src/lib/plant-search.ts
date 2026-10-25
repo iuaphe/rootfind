@@ -7,7 +7,16 @@ const COUNTY_COUNT_RETRY_DELAYS_MS = [400, 1200];
 const COUNTY_COUNT_ERROR = 'Unable to load the heatmap. Please try again.';
 
 function isRetryableStatus(status: number) {
-	return status === 408 || status >= 500;
+	return status === 408 || status === 429 || status >= 500;
+}
+
+function retryAfterMs(response: Response) {
+	const value = response.headers.get('Retry-After');
+	if (value === null) return 60_000;
+	const seconds = Number(value);
+	if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+	const date = Date.parse(value);
+	return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 60_000;
 }
 
 function waitForRetry(delay: number, signal: AbortSignal) {
@@ -66,8 +75,13 @@ export async function getSearchSuggestions(
 	return rows;
 }
 
-export async function getCountyCounts(params: URLSearchParams, signal: AbortSignal) {
+export async function getCountyCounts(
+	params: URLSearchParams,
+	signal: AbortSignal,
+	onRetry?: (retryNumber: number, delay: number, status?: number) => void
+) {
 	let response: Response | undefined;
+	let rateLimitRetried = false;
 	for (let attempt = 0; attempt <= COUNTY_COUNT_RETRY_DELAYS_MS.length; attempt++) {
 		try {
 			response = await fetch(`${apiUrl}/count-plants-by-county?${params}`, {
@@ -79,15 +93,27 @@ export async function getCountyCounts(params: URLSearchParams, signal: AbortSign
 			if (!(cause instanceof TypeError) || attempt === COUNTY_COUNT_RETRY_DELAYS_MS.length) {
 				throw new Error(COUNTY_COUNT_ERROR, { cause });
 			}
-			await waitForRetry(COUNTY_COUNT_RETRY_DELAYS_MS[attempt], signal);
+			const delay = COUNTY_COUNT_RETRY_DELAYS_MS[attempt] ?? 1200;
+			onRetry?.(attempt + 2, delay);
+			await waitForRetry(delay, signal);
 			continue;
 		}
 
 		if (response.ok) break;
-		if (!isRetryableStatus(response.status) || attempt === COUNTY_COUNT_RETRY_DELAYS_MS.length) {
+		if (
+			!isRetryableStatus(response.status) ||
+			attempt === COUNTY_COUNT_RETRY_DELAYS_MS.length ||
+			(response.status === 429 && rateLimitRetried)
+		) {
 			throw new Error(COUNTY_COUNT_ERROR);
 		}
-		await waitForRetry(COUNTY_COUNT_RETRY_DELAYS_MS[attempt], signal);
+		const delay =
+			response.status === 429
+				? retryAfterMs(response)
+				: (COUNTY_COUNT_RETRY_DELAYS_MS[attempt] ?? 1200);
+		if (response.status === 429) rateLimitRetried = true;
+		onRetry?.(attempt + 2, delay, response.status);
+		await waitForRetry(delay, signal);
 	}
 	if (!response?.ok) throw new Error(COUNTY_COUNT_ERROR);
 	const rows: unknown = await response.json();

@@ -10,7 +10,7 @@
 
 	let {
 		colorAssignment = {},
-		defaultColor = '#65a99b',
+		defaultColor = '#0c1938',
 		onCountyClick,
 		initialView = 'united-states',
 		height = '100vh',
@@ -91,7 +91,7 @@
 						projection: { type: COUNTY_PROJECTION },
 						sources: {},
 						layers: [
-							{ id: 'background', type: 'background', paint: { 'background-color': '#eef3f1' } }
+							{ id: 'background', type: 'background', paint: { 'background-color': '#000000' } }
 						]
 					}
 				});
@@ -140,8 +140,8 @@
 						type: 'line',
 						source: SOURCE,
 						paint: {
-							'line-color': '#254d46',
-							'line-opacity': 0.38,
+							'line-color': '#678472',
+							'line-opacity': 0.62,
 							'line-width': ['interpolate', ['linear'], ['zoom'], 2, 0.25, 7, 0.8]
 						}
 					});
@@ -223,10 +223,11 @@
 		display: grid;
 		place-content: center;
 		padding: 32px;
-		background: #eef3f1ed;
+		background: #0b1110ed;
+		color: #e8f5f0;
 		text-align: center;
 	}
 	.error {
-		color: #922f2f;
+		color: #ff9a9a;
 	}
 </style>

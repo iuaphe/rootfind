@@ -1,3 +1,19 @@
 /* Only UI source files contain utility classes; skip generated files and map data. */
 @import 'tailwindcss' source(none);
 @source '../**/*.{svelte,html,js,ts}';
+
+:root {
+	color-scheme: dark;
+	--surface: #000;
+	--surface-panel: #0b1110;
+	--surface-raised: #111a18;
+	--surface-hover: #18231c;
+	--border: #2d4034;
+	--border-strong: #486550;
+	--text: #e8f5f0;
+	--muted: #a6bdb4;
+	--accent: #26d65c;
+	--accent-subtle: #193521;
+	--accent-text: #061109;
+	--error: #ff9a9a;
+}
