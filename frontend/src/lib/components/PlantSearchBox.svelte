@@ -8,6 +8,7 @@
 		setSpecifier,
 		tokenizeSearchInput,
 		type SearchSuggestion,
+		type TaxonomyField,
 		type TaxonomySpecifier
 	} from '../plant-search-input.js';
 
@@ -31,6 +32,21 @@
 	const activeId = $derived(
 		expanded && suggestions[active] ? `plant-suggestion-${active}` : undefined
 	);
+	const suggestionTypes = {
+		kingdom: { label: 'Kingdom', color: '#72500b' },
+		subkingdom: { label: 'Subkingdom', color: '#8a3f19' },
+		superdivision: { label: 'Superdivision', color: '#96394b' },
+		division: { label: 'Division', color: '#9b286c' },
+		division_common: { label: 'Common division name', color: '#7e3e91' },
+		class: { label: 'Class', color: '#5d479f' },
+		class_common: { label: 'Common class name', color: '#3f579b' },
+		subclass: { label: 'Subclass', color: '#285e86' },
+		order_name: { label: 'Order', color: '#146674' },
+		family: { label: 'Family', color: '#1e6b50' },
+		family_common: { label: 'Common family name', color: '#526c21' },
+		common: { label: 'Common species name', color: '#78562e' },
+		scientific: { label: 'Species', color: '#566171' }
+	} satisfies Record<TaxonomyField | 'common' | 'scientific', { label: string; color: string }>;
 
 	function cancelSuggestions() {
 		clearTimeout(timer);
@@ -222,6 +238,8 @@
 				aria-busy={loading}
 			>
 				{#each suggestions as suggestion, index (`${suggestion.kind}:${suggestion.field}:${suggestion.value}`)}
+					{@const type =
+						suggestionTypes[suggestion.kind === 'taxonomy' ? suggestion.field : suggestion.kind]}
 					<li role="presentation">
 						<button
 							id={`plant-suggestion-${index}`}
@@ -231,19 +249,12 @@
 							aria-selected={active === index}
 							onpointerdown={(event) => event.preventDefault()}
 							onclick={() => accept(suggestion)}
+							style:--suggestion-color={type.color}
 						>
 							<span class={{ scientific: suggestion.kind === 'scientific' }}>
-								{suggestion.kind === 'taxonomy'
-									? `${suggestion.field}=${suggestion.value}`
-									: suggestion.value}
+								{suggestion.value}
 							</span>
-							<small
-								>{suggestion.kind === 'taxonomy'
-									? 'Taxonomy'
-									: suggestion.kind === 'common'
-										? 'Common name'
-										: 'Scientific name'}</small
-							>
+							<small>{type.label}</small>
 						</button>
 					</li>
 				{/each}
@@ -343,9 +354,9 @@
 	}
 	li button {
 		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 2px;
 		width: 100%;
 		padding: 10px;
 		border-radius: 4px;
@@ -358,9 +369,9 @@
 		background: #e7f1e9;
 	}
 	small {
-		flex-shrink: 0;
-		color: #60776c;
+		color: var(--suggestion-color);
 		font-size: 0.75rem;
+		font-style: italic;
 	}
 	.scientific {
 		font-style: italic;
@@ -376,11 +387,6 @@
 		font-size: 0.8125rem;
 	}
 	@media (max-width: 600px) {
-		li button {
-			align-items: flex-start;
-			flex-direction: column;
-			gap: 2px;
-		}
 		input {
 			min-width: min(140px, 100%);
 		}

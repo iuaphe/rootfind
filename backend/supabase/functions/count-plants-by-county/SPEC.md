@@ -5,12 +5,17 @@ Count all matching plants per recorded county in one database query. Requires
 
 ## Request
 
+Catalog enrichment filters are also supported: `minZone`, `maxZone`, `bloomMonths`,
+`bloomSeasons`, and `drainage`, using the same validation and matching rules as
+[search-plants](../search-plants/SPEC.md). Requires `202610250002_enrichment_filters.sql`.
+
 `GET /functions/v1/count-plants-by-county`
 
 Accepts all taxonomy parameters plus the name and trait parameters described in
 [search-plants](../search-plants/SPEC.md#request): `search`, `lifeCycle`, `foliage`,
 `sun`, `water`, `isWoody`, `isTree`, `edible`, `thorns`, `minHeight`, `maxHeight`,
-`minWidth`, and `maxWidth`. All are optional. Empty filters count every linked
+`minWidth`, `maxWidth`, `minZone`, `maxZone`, `bloomMonths`, `bloomSeasons`, and
+`drainage`. All are optional. Empty filters count every linked
 plant. `page` and `pageSize` are rejected; counts always cover all matches.
 Taxonomy support requires `202610250001_taxonomy_search.sql` and uses the same
 case-insensitive exact matches as plant search. `county` is also rejected here.

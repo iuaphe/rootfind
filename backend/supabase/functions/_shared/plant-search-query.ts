@@ -10,6 +10,9 @@ const enumOptions = {
   foliage: ['deciduous', 'evergreen'],
   sun: ['full sun', 'part shade', 'full shade'],
   water: ['high', 'med', 'medium', 'low'],
+  bloomMonths: ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'],
+  bloomSeasons: ['Spring', 'Summer', 'Fall', 'Winter'],
+  drainage: ['good drainage', 'well-drained', 'frequent standing water', 'occasionally wet', 'occasionally dry'],
 } as const;
 const booleans = ['isWoody', 'isTree', 'edible', 'thorns'];
 const measurements = ['minHeight', 'maxHeight', 'minWidth', 'maxWidth'];
@@ -40,7 +43,11 @@ export function parseQuery(
       if (!selected.length || selected.some(option => !allowed.includes(option))) {
         throw new InvalidQuery(`Invalid ${name} option`);
       }
-      filters[name] = [...new Set(selected.map(option => name === 'water' && option === 'med' ? 'medium' : option))];
+      filters[name] = [...new Set(selected.map(option => {
+        if (name === 'water' && option === 'med') return 'medium';
+        if (name === 'drainage' && option === 'well-drained') return 'good drainage';
+        return option;
+      }))];
     } else if (booleans.includes(name)) {
       if (value !== 'true' && value !== 'false') throw new InvalidQuery(`${name} must be true or false`);
       filters[name] = value === 'true';
@@ -55,6 +62,11 @@ export function parseQuery(
         throw new InvalidQuery(`${name} must be an integer between 1 and ${max}`);
       }
       filters[name] = Number(value);
+    } else if (name === 'minZone' || name === 'maxZone') {
+      if (!/^(?:[1-9]|1[0-3])$/.test(value)) {
+        throw new InvalidQuery(`${name} must be an integer between 1 and 13`);
+      }
+      filters[name] = Number(value);
     } else if (measurements.includes(name)) {
       if (!/^(0|[1-9]\d{0,4})$/.test(value) || Number(value) > 32767) {
         throw new InvalidQuery(`${name} must be an integer between 0 and 32767`);
@@ -64,7 +76,7 @@ export function parseQuery(
       throw new InvalidQuery(`Unknown parameter: ${name}`);
     }
   }
-  for (const dimension of ['Height', 'Width']) {
+  for (const dimension of ['Height', 'Width', 'Zone']) {
     const lower = filters[`min${dimension}`];
     const upper = filters[`max${dimension}`];
     if (typeof lower === 'number' && typeof upper === 'number' && lower > upper) {

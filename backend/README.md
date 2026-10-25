@@ -201,6 +201,12 @@ invalid options, and minimums greater than maximums return HTTP 400.
 
 ## Frontend
 
+The filter menu includes hardiness-zone bounds (1–13), bloom months, bloom seasons,
+and drainage. Zone bounds overlap the plant's recorded hardiness range. Multiple
+selections within one field use OR; different fields use AND. Bloom seasons do
+not infer exact bloom months. Unselected fields leave plants with missing records
+eligible. These filters apply to county counts, county plant lists, and autocomplete.
+
 The search box accepts comma-separated taxonomy specifiers alongside a plant name,
 for example `family=Aceraceae, class_common=Dicotyledons, purple`. Comma, blur,
 or Enter commits a specifier to a removable chip; choosing a taxonomy suggestion
@@ -252,6 +258,10 @@ For an existing hosted project with the name search RPC:
    after the existing taxonomy and search migrations. Deploy `suggest-plants`
    and redeploy both `search-plants` and `count-plants-by-county` so they include
    the updated shared parser. No plant data is rewritten by this migration.
+5. For the enrichment filters, apply `202610250002_enrichment_filters.sql` after
+   the taxonomy migration, then redeploy `search-plants`, `count-plants-by-county`,
+   and `suggest-plants` to include the updated shared parser. This migration only
+   updates filter validation and matching; it does not rewrite plant data.
 
 The SQL update replaces the existing RPC while preserving its argument and return
 types and ID-array response. Direct RPC clients pass enum arrays, boolean values,

@@ -15,6 +15,10 @@ Optional context parameters are the taxonomy and trait filters from
 are rejected. If `q` names a taxonomy field already in the context, that one filter
 is excluded so users can replace it; other filters still apply.
 
+Context also supports `minZone`, `maxZone`, `bloomMonths`, `bloomSeasons`, and
+`drainage` with the same rules as search-plants. These require migration
+`202610250002_enrichment_filters.sql`.
+
 ```json
 [
   {"kind":"taxonomy","field":"family","value":"Aceraceae"},

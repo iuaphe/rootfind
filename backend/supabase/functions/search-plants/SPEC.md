@@ -2,7 +2,7 @@
 
 Search or browse plants and return one page of matching plant IDs. This contract
 describes the handler and the `search_plants` RPC after migration
-`202610250001_taxonomy_search.sql`, following the county search migration
+`202610250002_enrichment_filters.sql` and `202610250001_taxonomy_search.sql`, following the county search migration
 `202610240015_search_county.sql` and query-plan optimization `202610240016_count_query_plan.sql`.
 
 ## Request
@@ -20,6 +20,11 @@ must be at most 8192 characters.
 | `foliage` | Comma-separated `deciduous`, `evergreen` | No foliage restriction |
 | `sun` | Comma-separated `full sun`, `part shade`, `full shade` | No sun restriction |
 | `water` | Comma-separated `low`, `medium`, `high`; `med` aliases `medium` | No water restriction |
+| `bloomMonths` | Comma-separated full month names, `January`–`December` | Match any selected recorded bloom month |
+| `bloomSeasons` | Comma-separated `Spring`, `Summer`, `Fall`, `Winter` | Match any selected recorded bloom season |
+| `drainage` | Comma-separated `good drainage`, `frequent standing water`, `occasionally wet`, `occasionally dry`; `well-drained` aliases `good drainage` | Match any selected recorded drainage condition |
+| `minZone` | Integer 1–13 | Plant's recorded maximum hardiness zone must be at least this value |
+| `maxZone` | Integer 1–13 | Plant's recorded minimum hardiness zone must be at most this value |
 | `isWoody` | Literal `true` or `false` | No woody-trait restriction |
 | `isTree` | Literal `true` or `false` | No tree-trait restriction |
 | `edible` | Literal `true` or `false` | No edibility restriction |
@@ -52,6 +57,10 @@ Direct RPC callers supply these fields as strings in `p_filters`.
 
 Selections within one enum filter use OR; separate filters use AND. A water
 filter matches any selected level in the plant's water array.
+Hardiness zones use inclusive interval overlap; `minZone` must not exceed `maxZone`.
+Bloom months and seasons are separate recorded fields: seasons do not imply months.
+Selecting both requires a match in each field. Drainage matches case-insensitively
+and treats stored `well-drained` values as `good drainage`.
 
 The optional county filter requires a `plant_county` link for that FIPS and applies
 together with all name and trait filters before pagination. Unknown counties and

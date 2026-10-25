@@ -50,6 +50,17 @@
 		document.getElementById('filter-button')?.focus();
 	}
 
+	function setZoneBound(key: 'minZone' | 'maxZone', value: number | undefined) {
+		filters[key] = value;
+		if (
+			filters.minZone !== undefined &&
+			filters.maxZone !== undefined &&
+			filters.minZone > filters.maxZone
+		) {
+			filters[key === 'minZone' ? 'maxZone' : 'minZone'] = value;
+		}
+	}
+
 	function submitSearch() {
 		if (loading) return;
 		try {
@@ -209,6 +220,36 @@
 						>
 					</div>
 					<div class="filter-grid">
+						<fieldset class="zones">
+							<legend>Hardiness zones</legend>
+							<div class="zone-range">
+								<div>
+									<label for="min-zone">Minimum zone</label>
+									<select
+										id="min-zone"
+										bind:value={() => filters.minZone, (value) => setZoneBound('minZone', value)}
+									>
+										<option value={undefined}>Any minimum</option>
+										{#each Array.from({ length: 13 }, (_, i) => i + 1) as zone (zone)}
+											<option value={zone}>{zone}</option>
+										{/each}
+									</select>
+								</div>
+								<div>
+									<label for="max-zone">Maximum zone</label>
+									<select
+										id="max-zone"
+										bind:value={() => filters.maxZone, (value) => setZoneBound('maxZone', value)}
+									>
+										<option value={undefined}>Any maximum</option>
+										{#each Array.from({ length: 13 }, (_, i) => i + 1) as zone (zone)}
+											<option value={zone}>{zone}</option>
+										{/each}
+									</select>
+								</div>
+							</div>
+							<p>Match plants whose recorded zones overlap this range.</p>
+						</fieldset>
 						{#each enumFilters as { key, label, options } (key)}
 							<fieldset>
 								<legend>{label}</legend>
@@ -384,6 +425,7 @@
 		font-weight: 600;
 	}
 	.filter-header p,
+	.zones p,
 	.traits p {
 		margin-top: 4px;
 		color: #60776c;
@@ -402,6 +444,29 @@
 	}
 	fieldset {
 		min-width: 0;
+	}
+	.zones {
+		grid-column: 1 / -1;
+	}
+	.zone-range {
+		display: flex;
+		gap: 16px;
+	}
+	.zone-range > div {
+		display: flex;
+		flex: 1;
+		min-width: 0;
+		flex-direction: column;
+		gap: 6px;
+		font-size: 0.8125rem;
+	}
+	.zone-range select {
+		width: 100%;
+		padding: 8px;
+		border: 1px solid #809c90;
+		border-radius: 6px;
+		background: #f7faf8;
+		color: inherit;
 	}
 	legend {
 		margin-bottom: 10px;
@@ -454,6 +519,7 @@
 		opacity: 0.6;
 	}
 	input:focus-visible,
+	select:focus-visible,
 	button:focus-visible {
 		outline: 2px solid #254d46;
 		outline-offset: 2px;
