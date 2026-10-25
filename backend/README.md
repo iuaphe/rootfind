@@ -197,6 +197,27 @@ invalid options, and minimums greater than maximums return HTTP 400.
 
 ## Frontend
 
+The search box accepts comma-separated taxonomy specifiers alongside a plant name,
+for example `family=Aceraceae, class_common=Dicotyledons, purple`. Comma, blur,
+or Enter commits a specifier to a removable chip; choosing a taxonomy suggestion
+does the same. Enter accepts the highlighted suggestion (the first by default);
+arrow keys change it and Escape closes the list. Search submits the current chips
+and remaining name. Backspace in an empty input edits the last chip.
+
+Supported fields are `kingdom`, `subkingdom`, `superdivision`, `division`,
+`division_common`, `class`, `class_common`, `subclass`, `order_name`, `family`, and
+`family_common`. Values match exactly without regard to case. Different fields
+and the name/trait filters use AND. Entering a field again replaces its chip.
+In HTTP requests these are separate parameters, e.g.
+`?family=Aceraceae&class_common=Dicotyledons&search=purple`; `search` remains a
+literal name query. Values are trimmed with whitespace collapsed and limited to
+100 characters (50 for `kingdom`).
+
+`GET /functions/v1/suggest-plants?q=acer` returns up to 12 suggestions ordered by
+taxonomy, common names, then scientific names. It accepts the same taxonomy and
+trait filters as context. `q=family=Ac` restricts suggestions to that rank.
+See [the autocomplete contract](supabase/functions/suggest-plants/SPEC.md).
+
 No login or user bearer token is needed. Send the project publishable key:
 
 ```js
@@ -223,6 +244,10 @@ For an existing hosted project with the name search RPC:
 1. Apply migration 008 (inches/water arrays), then `supabase/migrations/202610240009_search_water_pagination.sql`. The latter supersedes the earlier search-filter function. The MOBOT `prepare` command runs both 008 and 009 after taking a backup; do not run it until the current feet-based import has finished.
 2. For the county map and county-specific plant lists, apply migrations 010, 011, and 012, then deploy `count-plants-by-county` and redeploy `search-plants`. Include `index.ts`, `handler.ts`, `query.ts`, and the imported `../_shared/plant-search-query.ts` file for each. CLI deployment bundles the shared file automatically.
 3. Keep JWT verification off in the Dashboard (matching `config.toml`).
+4. For taxonomy chips and autocomplete, apply `202610250001_taxonomy_search.sql`
+   after the existing taxonomy and search migrations. Deploy `suggest-plants`
+   and redeploy both `search-plants` and `count-plants-by-county` so they include
+   the updated shared parser. No plant data is rewritten by this migration.
 
 The SQL update replaces the existing RPC while preserving its argument and return
 types and ID-array response. Direct RPC clients pass enum arrays, boolean values,

@@ -2,10 +2,10 @@
 	import { onMount } from 'svelte';
 	import type { ExpressionSpecification, Map as MapLibreMap } from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
-	import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 	import countiesUrl from '../data/counties.geojson?url';
 	import type { CountyFeatureCollection } from '../types/counties';
 	import { MAP_BOUNDS, type MapProps } from './map';
+	import { COUNTY_PROJECTION, initializeCountyProjection } from './map-projection';
 
 	let {
 		colorAssignment = {},
@@ -70,7 +70,7 @@
 				const data: CountyFeatureCollection = await response.json();
 				if (disposed) return;
 				counties = data;
-				maplibre.setWorkerUrl(workerUrl);
+				initializeCountyProjection(maplibre);
 				const byId = new globalThis.Map(data.features.map((county) => [county.id, county]));
 				instance = new maplibre.Map({
 					container,
@@ -87,6 +87,7 @@
 					attributionControl: false,
 					style: {
 						version: 8,
+						projection: { type: COUNTY_PROJECTION },
 						sources: {},
 						layers: [
 							{ id: 'background', type: 'background', paint: { 'background-color': '#eef3f1' } }

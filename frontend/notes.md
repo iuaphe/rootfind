@@ -1,32 +1,11 @@
 db password: jkFajULnLbuxLc3n
 
-Let's improve the search bar and add filters. The search bar should take up the width of the screen, and there should be a filter button to the right of it. When you click the filter button, it should open the filter menu. Base the filters off of this snippet from the SQL:
+We need to improve the search box.
 
--- Provisional schema. Measurements must all use the same unit (to be decided).
-create type public.life_cycle_enum as enum ('perennial', 'biennial', 'annual');
-create type public.foliage_type as enum ('deciduous', 'evergreen');
-create type public.sun_type as enum ('full sun', 'part shade', 'full shade');
-create type public.water_type as enum ('high', 'med', 'low');
+For one, the search should support taxonomical searches. Here's how this should work: your search may consist of many optional taxonomical specifiers, separated by commas. For instance, a search could contain "family=Aceraceae", which would find all the plants in Aceraceae. Once this is typed, it should turn into one of those boxes with an x (to remove it). There's a specifier for each colum in the plant_taxonomy table (except for plant_id and lineage), including the common names. So, a full search might look something like:
 
-create table public.plants (
-plant_id integer generated always as identity primary key,
-genus varchar(100) not null,
-species varchar(100) not null,
-life_cycle public.life_cycle_enum,
-foliage public.foliage_type,
-minheight smallint,
-maxheight smallint,
-minwidth smallint,
-maxwidth smallint,
-is_woody boolean,
-is_tree boolean,
-edible boolean,
-thorns boolean,
-sun public.sun_type,
-water public.water_type,
-image_link text,
-misc text[],
-constraint uq_genus_species unique (genus, species)
-);
+[x family=Aceraceae] purple
 
-min/max properties should be a two-sided slider. booleans should be checkboxes. things with enum values should have buttons for each that you can select. e.g., for life cycle, it'll say "life cycle" and then have three buttons under it, one for each type. holler if you have any questions/clarifications.
+Which would find all plants in Aceraceae with the scientific or common name purple.
+
+Also, there should be autocomplete, for all of these. When you type in the search box, it should list below a set of suggestions which match the current search query. There can be suggestions for common names, scientific names, or for any taxonomical specifier. Ideally, the order should be: any tax. specifier, common name, and then scientific name. Clicking the suggestion will accept it (or pressing enter will accept the first (most relevant) one).

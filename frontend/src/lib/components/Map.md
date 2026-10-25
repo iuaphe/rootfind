@@ -4,6 +4,13 @@
 (WebGL). No API key, remote basemap, or tile service is needed. The GeoJSON is
 loaded once in the browser, separately from the JavaScript bundle.
 
+The map uses an Albers equal-area projection (WGS84, standard parallels 29.5°
+and 45.5°, central meridian 96°W). Alaska and the other states share the same
+area scale. The source GeoJSON and callback features remain in WGS84 longitude/
+latitude; `map-projection.ts` configures the display projection and installs a
+local proj4 converter in each MapLibre tiling worker at startup.
+Custom CRS support requires MapLibre GL JS 6.15 or later.
+
 ```svelte
 <script lang="ts">
 	import { Map, type CountyFeature } from '#lib';
@@ -32,7 +39,8 @@ lightens the hovered county, including all of its islands and disconnected parts
 `initialView` defaults to `united-states`, fitting all 50 states. It also accepts
 `contiguous`, `alaska`, `hawaii`, `puerto-rico`, `virgin-islands`, `american-samoa`,
 and `guam-mariana`. All 3,233 features remain available regardless of the initial
-view. Aleutian islands are displayed across the date line using map wrapping.
+view. The projection keeps Aleutian islands continuous across the date line
+without repeating the world.
 
 Left-drag pans; wheel/trackpad scroll zooms around the pointer. Touch panning and
 pinching and keyboard arrows and +/− are supported. Rotation is disabled to keep

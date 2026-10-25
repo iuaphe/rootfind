@@ -1,6 +1,40 @@
 import { apiUrl, apikey } from './plant-details.js';
+import { isTaxonomyField, type SearchSuggestion } from './plant-search-input.js';
 
 export const COUNTY_PAGE_SIZE = 20;
+
+export async function getSearchSuggestions(
+	query: string,
+	context: URLSearchParams,
+	signal: AbortSignal
+): Promise<SearchSuggestion[]> {
+	const params = new URLSearchParams(context);
+	params.delete('search');
+	params.set('q', query);
+	const response = await fetch(`${apiUrl}/suggest-plants?${params}`, {
+		headers: { apikey },
+		signal
+	});
+	if (!response.ok) throw new Error('Suggestions are unavailable. You can still type and search.');
+	const rows: unknown = await response.json();
+	if (
+		!Array.isArray(rows) ||
+		rows.length > 12 ||
+		!rows.every(
+			(row) =>
+				row &&
+				typeof row.value === 'string' &&
+				row.value.length > 0 &&
+				row.value.length <= 201 &&
+				(row.kind === 'taxonomy'
+					? typeof row.field === 'string' && isTaxonomyField(row.field)
+					: (row.kind === 'common' || row.kind === 'scientific') && row.field === null)
+		)
+	) {
+		throw new Error('Suggestions are unavailable. You can still type and search.');
+	}
+	return rows;
+}
 
 export async function getCountyCounts(params: URLSearchParams, signal: AbortSignal) {
 	const response = await fetch(`${apiUrl}/count-plants-by-county?${params}`, {

@@ -1,5 +1,10 @@
 export class InvalidQuery extends Error {}
 
+export const taxonomyFields = [
+  'kingdom', 'subkingdom', 'superdivision', 'division', 'division_common',
+  'class', 'class_common', 'subclass', 'order_name', 'family', 'family_common',
+] as const;
+
 const enumOptions = {
   lifeCycle: ['perennial', 'biennial', 'annual'],
   foliage: ['deciduous', 'evergreen'],
@@ -22,6 +27,13 @@ export function parseQuery(
       const search = value.trim().replace(/\s+/g, ' ');
       if (search.length > 200) throw new InvalidQuery('search must not exceed 200 characters');
       filters.search = search;
+    } else if ((taxonomyFields as readonly string[]).includes(name)) {
+      const normalized = value.trim().replace(/\s+/g, ' ');
+      const limit = name === 'kingdom' ? 50 : 100;
+      if (!normalized || normalized.length > limit) {
+        throw new InvalidQuery(`${name} must contain between 1 and ${limit} characters`);
+      }
+      filters[name] = normalized;
     } else if (Object.hasOwn(enumOptions, name)) {
       const selected = value.split(',');
       const allowed: readonly string[] = enumOptions[name as keyof typeof enumOptions];

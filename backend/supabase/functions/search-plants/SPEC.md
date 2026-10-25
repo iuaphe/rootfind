@@ -2,7 +2,7 @@
 
 Search or browse plants and return one page of matching plant IDs. This contract
 describes the handler and the `search_plants` RPC after migration
-`202610240011_search_county.sql`.
+`202610250001_taxonomy_search.sql`.
 
 ## Request
 
@@ -39,6 +39,16 @@ within a single enum parameter are deduplicated.
 
 The name search is a case-insensitive literal substring of `genus + ' ' + species`
 or any linked common name. SQL wildcard characters have no special meaning.
+
+Optional taxonomy parameters: `kingdom`, `subkingdom`, `superdivision`, `division`,
+`division_common`, `class`, `class_common`, `subclass`, `order_name`, `family`,
+and `family_common`. Each accepts one nonempty string of at most 100 characters
+(50 for `kingdom`) after trimming and collapsing whitespace. Values match exactly,
+case-insensitively, and combine with one another and all other filters using AND.
+`plant_id` and `lineage` are not search parameters. For example,
+`?family=Aceraceae&search=purple` finds names containing “purple” in that family.
+Direct RPC callers supply these fields as strings in `p_filters`.
+
 Selections within one enum filter use OR; separate filters use AND. A water
 filter matches any selected level in the plant's water array.
 

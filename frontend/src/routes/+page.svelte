@@ -3,6 +3,12 @@
 	import { onMount } from 'svelte';
 	import RangeSlider from '#lib/components/RangeSlider.svelte';
 	import CountySidebar from '#lib/components/CountySidebar.svelte';
+	import PlantSearchBox from '#lib/components/PlantSearchBox.svelte';
+	import {
+		applySearchInput,
+		parseSearchInput,
+		type TaxonomySpecifier
+	} from '#lib/plant-search-input.js';
 	import { createPlantDetailsClient } from '#lib/plant-details.js';
 	import { getCountyCounts } from '#lib/plant-search.js';
 	import {
@@ -18,6 +24,7 @@
 
 	const getPlantDetails = createPlantDetailsClient();
 	let search = $state('');
+	let taxonomy = $state<TaxonomySpecifier[]>([]);
 	let loading = $state(false);
 	let error = $state('');
 	let message = $state('');
@@ -30,6 +37,7 @@
 	let filters = $state(createFilters());
 	let appliedFilters = $state(createFilters());
 	const activeFilters = $derived(countFilters(appliedFilters));
+	const suggestionContext = $derived(filterParams(appliedFilters).toString());
 
 	function toggleOption(key: EnumFilterKey, option: string) {
 		filters[key] = filters[key].includes(option)
@@ -44,6 +52,14 @@
 
 	function submitSearch() {
 		if (loading) return;
+		try {
+			const parsed = parseSearchInput(search, taxonomy);
+			search = parsed.text;
+			taxonomy = parsed.specifiers;
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Check the search query.';
+			return;
+		}
 		if (filtersOpen) {
 			appliedFilters = $state.snapshot(filters);
 			closeFilters();
@@ -54,9 +70,12 @@
 	async function searchPlants() {
 		const query = search.trim().replace(/\s+/g, ' ');
 		if (loading) return;
-		const params = filterParams(appliedFilters);
-		if (query) params.set('search', query);
-		const description = query ? `“${query}”` : 'all plants';
+		const params = applySearchInput(filterParams(appliedFilters), query, taxonomy);
+		const description =
+			[
+				...taxonomy.map(({ field, value }) => `${field}=${value}`),
+				...(query ? [`“${query}”`] : [])
+			].join(', ') || 'all plants';
 
 		controller?.abort();
 		controller = new AbortController();
@@ -88,8 +107,8 @@
 				const num = counts[parseInt(c.geoid, 10)] ?? 0;
 				// const hue = 360 * (num / max);
 				// const [r, g, b] = hsvToRgb(hue, 30, 100);
-				const greenness = 255 * (num / max);
-				return `rgb(${greenness}, ${greenness}, ${greenness})`;
+				const greenness = 255 * (1 - num / max);
+				return `rgb(${greenness}, 255, ${greenness})`;
 			};
 			const matchedCounties = values.filter((count) => count > 0).length;
 			message = matchedCounties
@@ -141,15 +160,7 @@
 		>
 			<label for="plant-search">Search for a plant</label>
 			<div class="search-controls">
-				<input
-					id="plant-search"
-					name="search"
-					type="search"
-					bind:value={search}
-					placeholder="Enter a plant name"
-					aria-describedby="search-status"
-					maxlength="200"
-				/>
+				<PlantSearchBox bind:text={search} bind:specifiers={taxonomy} context={suggestionContext} />
 				<button class="primary" type="submit" disabled={loading}>
 					{loading ? 'Searching…' : 'Search'}
 				</button>
@@ -180,6 +191,9 @@
 					{#if activeFilters > 0}<span class="filter-count">{activeFilters}</span>{/if}
 				</button>
 			</div>
+			<p id="search-help" class="search-help">
+				Add taxonomy filters with a comma, e.g. family=Aceraceae. Enter accepts a suggestion.
+			</p>
 			{#if filtersOpen}
 				<section id="plant-filters" class="filter-menu" aria-labelledby="filter-heading">
 					<div class="filter-header">
@@ -302,15 +316,12 @@
 	}
 	.search-controls {
 		display: flex;
+		align-items: flex-start;
 		gap: 8px;
 	}
-	input[type='search'] {
-		min-width: 0;
-		flex: 1;
-		border: 1px solid #809c90;
-		border-radius: 6px;
-		padding: 12px 14px;
-		background: #f7faf8;
+	.search-help {
+		color: #60776c;
+		font-size: 0.75rem;
 	}
 	button {
 		display: inline-flex;
@@ -460,6 +471,10 @@
 		}
 		.search-controls {
 			gap: 6px;
+			flex-wrap: wrap;
+		}
+		.search-controls :global(.search-box) {
+			flex-basis: 100%;
 		}
 		.search-controls button {
 			padding: 10px;
