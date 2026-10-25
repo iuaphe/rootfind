@@ -22,6 +22,18 @@
 		type EnumFilterKey
 	} from '#lib/plant-filters.js';
 
+	const LOW_COUNT_COLOR = [12, 25, 56] as const;
+	const HIGH_COUNT_COLOR = [38, 214, 92] as const;
+
+	function heatColor(count: number, max: number) {
+		const amount = Math.pow(Math.min(count, max) / max, 0.5);
+		const mix = (index: 0 | 1 | 2) =>
+			Math.round(
+				LOW_COUNT_COLOR[index] + (HIGH_COUNT_COLOR[index] - LOW_COUNT_COLOR[index]) * amount
+			);
+		return `rgb(${mix(0)}, ${mix(1)}, ${mix(2)})`;
+	}
+
 	const getPlantDetails = createPlantDetailsClient();
 	let search = $state('');
 	let taxonomy = $state<TaxonomySpecifier[]>([]);
@@ -31,7 +43,7 @@
 	let countyCounts = $state.raw<Record<number, number>>({});
 	let completedSearch = $state<string | null>(null);
 	let selectedCounty = $state.raw<CountyProperties | null>(null);
-	let assignment: CountyColorAssignment = $state(() => `#bbb`);
+	let assignment: CountyColorAssignment = $state(() => '#0c1938');
 	let controller: AbortController | undefined;
 	let filtersOpen = $state(false);
 	let filters = $state(createFilters());
@@ -96,10 +108,15 @@
 		message = `Searching ${description}…`;
 		completedSearch = null;
 		countyCounts = {};
-		assignment = () => '#fff';
+		assignment = () => '#0c1938';
 
 		try {
-			const counts = await getCountyCounts(params, signal);
+			const counts = await getCountyCounts(params, signal, (retryNumber, delay, status) => {
+				message =
+					status === 429
+						? `Heatmap service is busy; retrying in ${Math.ceil(delay / 1000)}s (attempt ${retryNumber} of 3)…`
+						: `Heatmap request failed; retrying (attempt ${retryNumber} of 3)…`;
+			});
 			if (signal.aborted) return;
 			countyCounts = counts;
 			completedSearch = params.toString();
@@ -118,8 +135,7 @@
 				const num = counts[parseInt(c.geoid, 10)] ?? 0;
 				// const hue = 360 * (num / max);
 				// const [r, g, b] = hsvToRgb(hue, 30, 100);
-				const greenness = 255 * (1 - num / max);
-				return `rgb(${greenness}, 255, ${greenness})`;
+				return heatColor(num, max);
 			};
 			const matchedCounties = values.filter((count) => count > 0).length;
 			message = matchedCounties
@@ -220,7 +236,7 @@
 						>
 					</div>
 					<div class="filter-grid">
-						<fieldset class="zones">
+						<!-- <fieldset class="zones">
 							<legend>Hardiness zones</legend>
 							<div class="zone-range">
 								<div>
@@ -249,7 +265,7 @@
 								</div>
 							</div>
 							<p>Match plants whose recorded zones overlap this range.</p>
-						</fieldset>
+						</fieldset> -->
 						{#each enumFilters as { key, label, options } (key)}
 							<fieldset>
 								<legend>{label}</legend>
@@ -329,8 +345,8 @@
 		display: flex;
 		height: 100dvh;
 		flex-direction: column;
-		background: #eef3f1;
-		color: #254d46;
+		background: var(--surface);
+		color: var(--text);
 	}
 	.map-area {
 		position: relative;
@@ -346,9 +362,9 @@
 		position: relative;
 		z-index: 2;
 		padding: 16px 24px;
-		border-bottom: 1px solid #cbd9d3;
-		background: #fff;
-		box-shadow: 0 2px 8px #254d460a;
+		border-bottom: 1px solid var(--border);
+		background: var(--surface-panel);
+		box-shadow: 0 2px 12px #0008;
 	}
 	form > label {
 		display: block;
@@ -361,7 +377,7 @@
 		gap: 8px;
 	}
 	.search-help {
-		color: #60776c;
+		color: var(--muted);
 		font-size: 0.75rem;
 	}
 	button {
@@ -369,32 +385,33 @@
 		align-items: center;
 		justify-content: center;
 		gap: 8px;
-		border: 1px solid #cbd9d3;
+		border: 1px solid var(--border);
 		border-radius: 6px;
 		padding: 10px 16px;
-		background: white;
+		background: var(--surface-raised);
+		color: var(--text);
 		cursor: pointer;
 		font-weight: 500;
 	}
 	.primary {
-		background: #254d46;
-		color: white;
-		border-color: #254d46;
+		background: var(--accent);
+		color: var(--accent-text);
+		border-color: var(--accent);
 	}
 	button:hover:not(:disabled) {
-		box-shadow: inset 0 0 0 1px #809c90;
+		box-shadow: inset 0 0 0 1px var(--accent);
 	}
 	.filter-toggle.active,
 	.option[aria-pressed='true'] {
-		background: #e7f1e9;
-		border-color: #326b50;
-		color: #1c5038;
+		background: var(--accent-subtle);
+		border-color: var(--accent);
+		color: var(--text);
 	}
 	.filter-count {
 		padding: 0 6px;
 		border-radius: 10px;
-		background: #326b50;
-		color: white;
+		background: var(--accent);
+		color: var(--accent-text);
 		font-size: 0.75rem;
 	}
 	.filter-menu {
@@ -404,10 +421,10 @@
 		width: min(660px, calc(100% - 48px));
 		max-height: calc(100dvh - 100% - 20px);
 		overflow-y: auto;
-		border: 1px solid #cbd9d3;
+		border: 1px solid var(--border);
 		border-radius: 12px;
-		background: white;
-		box-shadow: 0 12px 40px #254d4626;
+		background: var(--surface-panel);
+		box-shadow: 0 12px 40px #000b;
 	}
 	.filter-header,
 	.filter-footer {
@@ -418,7 +435,7 @@
 		padding: 20px 24px;
 	}
 	.filter-header {
-		border-bottom: 1px solid #e5ebe7;
+		border-bottom: 1px solid var(--border);
 	}
 	h2 {
 		font-size: 1.125rem;
@@ -428,7 +445,7 @@
 	.zones p,
 	.traits p {
 		margin-top: 4px;
-		color: #60776c;
+		color: var(--muted);
 		font-size: 0.8125rem;
 	}
 	.close-button {
@@ -501,14 +518,14 @@
 	input[type='checkbox'] {
 		width: 17px;
 		height: 17px;
-		accent-color: #326b50;
+		accent-color: var(--accent);
 	}
 	.filter-footer {
 		position: sticky;
 		bottom: 0;
 		z-index: 4;
-		border-top: 1px solid #e5ebe7;
-		background: white;
+		border-top: 1px solid var(--border);
+		background: var(--surface-panel);
 	}
 	.clear-button {
 		border-color: transparent;
@@ -521,7 +538,7 @@
 	input:focus-visible,
 	select:focus-visible,
 	button:focus-visible {
-		outline: 2px solid #254d46;
+		outline: 2px solid var(--accent);
 		outline-offset: 2px;
 	}
 	p {
@@ -529,7 +546,7 @@
 		font-size: 0.875rem;
 	}
 	.error {
-		color: #922f2f;
+		color: var(--error);
 	}
 	@media (max-width: 600px) {
 		.search-panel {

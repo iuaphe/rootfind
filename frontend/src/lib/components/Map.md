@@ -28,12 +28,15 @@ Custom CRS support requires MapLibre GL JS 6.15 or later.
 `colorAssignment` accepts either an object keyed by five-character county GEOID or
 a function `(county: CountyProperties) => string | undefined`. Colors use MapLibre
 CSS color syntax (for example hex, RGB, HSL, or named colors). Missing entries use
-`defaultColor`, which defaults to `#65a99b`. Updates to reactive assignments and
+`defaultColor`, which defaults to a dark green shade. Updates to reactive assignments and
 state read by a color function repaint the map without reloading boundaries.
 Each county fades from its current color to the new color over 5 seconds.
 An update during a fade continues from the displayed color. The initial colors
 appear immediately. This color-only fade also runs with reduced motion enabled.
 Keep identifiers as strings to preserve leading zeros.
+
+The search view uses a two-color dark-blue-to-bright-green scale for county counts.
+The scale adapts to the highest county count in each search.
 
 `onCountyClick` receives the original complete `CountyFeature` and the mouse event.
 Dragging is handled separately from clicking. A translucent white overlay slightly
