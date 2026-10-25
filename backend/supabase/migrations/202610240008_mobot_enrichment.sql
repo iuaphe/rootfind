@@ -36,6 +36,10 @@ alter table public.plants
   add column if not exists max_zone smallint,
   add column if not exists bloom_months public.month_enum[];
 
+-- The taxonomy view expands p.*, so it depends on the old water type.
+-- Rebuild it inside this transaction after converting the column.
+drop view if exists public.plants_with_taxonomy;
+
 do $$
 declare water_column_type text;
 begin
@@ -70,6 +74,17 @@ comment on column public.plants.maxheight is 'Unit: inches (MOBOT enrichment v1)
 comment on column public.plants.minwidth is 'Unit: inches (MOBOT enrichment v1)';
 comment on column public.plants.maxwidth is 'Unit: inches (MOBOT enrichment v1)';
 comment on column public.plants.water is 'Supported water levels; med is normalized to medium';
+
+do $$ begin
+  if to_regclass('public.plant_taxonomy') is not null then
+    create view public.plants_with_taxonomy as
+    select p.*, t.division, t.division_common, t.class, t.class_common,
+      t.order_name, t.family, t.family_common, t.lineage as taxonomy_lineage
+    from public.plants p
+    left join public.plant_taxonomy t on t.plant_id = p.plant_id;
+    grant select on public.plants_with_taxonomy to anon, authenticated;
+  end if;
+end $$;
 
 -- These helpers keep existing USDA RPC clients working with scalar water and
 -- feet. New clients can send arrays and measurement_units: inches explicitly.

@@ -12,7 +12,27 @@ const setup = async (db: PGlite) => {
   await db.exec('create role anon; create role authenticated; create role service_role;');
   await db.exec(await migration('202610240001_plants.sql'));
   await db.exec(await migration('20261024000601_upsert_plant.sql'));
+  await db.exec(await migration('20261024000702_plant_taxonomy.sql'));
 };
+
+test('taxonomy writes reject anon and the view survives water conversion and reruns', async () => {
+  const db = new PGlite();
+  try {
+    await setup(db);
+    await db.exec("insert into public.plants(genus,species,water) values ('Acer','rubrum','med'); set role anon;");
+    await assert.rejects(db.query("select public.upsert_plant_taxonomy(1, '{\"family\":\"Wrong\"}'::jsonb)"), /permission denied/);
+    await db.exec("reset role; set role authenticated; select public.upsert_plant_taxonomy(1, '{\"family\":\"Sapindaceae\"}'::jsonb); reset role;");
+    const schema = await migration('202610240008_mobot_enrichment.sql');
+    for (let run = 0; run < 2; run++) {
+      await db.exec(schema);
+      await db.exec('set role anon');
+      assert.deepEqual((await db.query('select family, to_jsonb(water) as water, min_zone from public.plants_with_taxonomy')).rows,
+        [{ family: 'Sapindaceae', water: ['medium'], min_zone: null }]);
+      await assert.rejects(db.query("select public.upsert_plant_taxonomy(1, '{}'::jsonb)"), /permission denied/);
+      await db.exec('reset role');
+    }
+  } finally { await db.close(); }
+});
 
 test('MOBOT migration converts feet once, preserves water, merges ranges, and audits repeat-safe updates', async () => {
   const db = new PGlite();
