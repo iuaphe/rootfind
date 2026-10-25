@@ -19,7 +19,10 @@ as $$
     )
     and (not p_filters ? 'lifeCycle' or p.life_cycle::text in (select jsonb_array_elements_text(p_filters->'lifeCycle')))
     and (not p_filters ? 'foliage' or p.foliage::text in (select jsonb_array_elements_text(p_filters->'foliage')))
-    and (not p_filters ? 'sun' or to_jsonb(p.sun) ?| array(select jsonb_array_elements_text(p_filters->'sun')))
+    and (not p_filters ? 'sun' or
+      (case when jsonb_typeof(to_jsonb(p.sun)) = 'array' then to_jsonb(p.sun)
+        else jsonb_build_array(to_jsonb(p.sun)) end)
+      ?| array(select jsonb_array_elements_text(p_filters->'sun')))
     and (not p_filters ? 'water' or p.water && array(
       select (case value when 'med' then 'medium' else value end)::public.water_level_enum
       from jsonb_array_elements_text(p_filters->'water') as levels(value)

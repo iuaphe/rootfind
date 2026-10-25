@@ -2,7 +2,7 @@
 
 Search or browse plants and return one page of matching plant IDs. This contract
 describes the handler and the `search_plants` RPC after migration
-`202610240011_search_county.sql`.
+`202610240015_search_county.sql` (and the optimized query plan in migration `202610240016`).
 
 ## Request
 

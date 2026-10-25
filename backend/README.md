@@ -1,5 +1,9 @@
 # Plant search
 
+BONAP CSV imports use dedicated upsert functions. See
+[the implementation report and run instructions](scripts/BONAP_IMPORT_REPORT.md)
+for previews, parent-species merging, county batch inserts, and migration prerequisites.
+
 MOBOT enrichment tooling and its collection/prepare/apply workflow are documented
 in [scripts/MOBOT.md](scripts/MOBOT.md). Wait until the current USDA import finishes
 before applying its schema migration: it changes stored measurements to inches
@@ -62,7 +66,7 @@ if (!response.ok) throw new Error((await response.json()).error ?? 'County count
 const countsByCounty = await response.json();
 ```
 
-Apply `supabase/migrations/202610240010_count_plants_by_county.sql` after migrations
+Apply `supabase/migrations/202610240014_count_plants_by_county.sql` after migrations
 008 and 009. The migration shares validation and matching predicates between
 `search_plants` and the new `count_plants_by_county(p_filters jsonb)` RPC while
 preserving search pagination. Counts are grouped in the database; plant IDs and
@@ -92,10 +96,10 @@ species**. Editing a name or filter without submitting does not change the activ
 map or county search. Changing counties, starting a search, and closing the
 sidebar cancel obsolete sidebar requests.
 
-Apply `supabase/migrations/202610240011_search_county.sql` after migration 010 and
+Apply `supabase/migrations/202610240015_search_county.sql` after migration 014 and
 redeploy `search-plants` to enable county selection in the frontend.
 
-Then apply `supabase/migrations/202610240012_count_query_plan.sql`. It evaluates
+Then apply `supabase/migrations/202610240016_count_query_plan.sql`. It evaluates
 plant filters once before joining county links and searches common names as a
 set. This avoids the slow join plan that approached the anonymous role's
 three-second SQL timeout and could surface as a 502. It also preserves sun filtering
@@ -221,7 +225,7 @@ responses allow short public caching.
 For an existing hosted project with the name search RPC:
 
 1. Apply migration 008 (inches/water arrays), then `supabase/migrations/202610240009_search_water_pagination.sql`. The latter supersedes the earlier search-filter function. The MOBOT `prepare` command runs both 008 and 009 after taking a backup; do not run it until the current feet-based import has finished.
-2. For the county map and county-specific plant lists, apply migrations 010, 011, and 012, then deploy `count-plants-by-county` and redeploy `search-plants`. Include `index.ts`, `handler.ts`, `query.ts`, and the imported `../_shared/plant-search-query.ts` file for each. CLI deployment bundles the shared file automatically.
+2. For the county map and county-specific plant lists, apply migrations 014, 015, and 016, then deploy `count-plants-by-county` and redeploy `search-plants`. Include `index.ts`, `handler.ts`, `query.ts`, and the imported `../_shared/plant-search-query.ts` file for each. CLI deployment bundles the shared file automatically.
 3. Keep JWT verification off in the Dashboard (matching `config.toml`).
 
 The SQL update replaces the existing RPC while preserving its argument and return

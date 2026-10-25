@@ -105,18 +105,18 @@ test('Postgres county counts match unpaginated search and preserve the existing 
   try {
     await db.exec('create role anon; create role authenticated; create role service_role;');
     const dir = new URL('../supabase/migrations/', import.meta.url);
-    const migration = '202610240010_count_plants_by_county.sql';
+    const migration = '202610240014_count_plants_by_county.sql';
     for (const file of (await readdir(dir)).filter(name => name.endsWith('.sql') && name < migration).sort()) {
       await db.exec(await readFile(new URL(file, dir), 'utf8'));
     }
     await db.exec(`
       insert into public.plants (genus, species, life_cycle, foliage, sun, water,
         is_woody, is_tree, edible, thorns, minheight, maxheight, minwidth, maxwidth)
-      values ('Asclepias', 'tuberosa', 'perennial', 'deciduous', 'full sun', array['low','medium']::public.water_level_enum[],
+      values ('Asclepias', 'tuberosa', 'perennial', 'deciduous', array['full sun']::public.sun_type[], array['low','medium']::public.water_level_enum[],
           false, false, true, false, 12, 60, 20, 40),
-        ('Asclepias', 'incarnata', 'annual', 'evergreen', 'full shade', array['high']::public.water_level_enum[],
+        ('Asclepias', 'incarnata', 'annual', 'evergreen', array['full shade']::public.sun_type[], array['high']::public.water_level_enum[],
           false, false, false, true, 30, 100, 30, 50),
-        ('Quercus', 'alba', 'perennial', 'deciduous', 'part shade', array['medium']::public.water_level_enum[],
+        ('Quercus', 'alba', 'perennial', 'deciduous', array['part shade']::public.sun_type[], array['medium']::public.water_level_enum[],
           true, true, false, null, 100, 500, 100, 400);
       insert into public.plants (genus, species) values ('Unknown', 'traits'), ('Unlinked', 'plant');
       insert into public.plants (genus, species) select 'Bulk', 'species' || i from generate_series(1, 105) i;
