@@ -35,6 +35,80 @@ npx supabase migration up --local
 npx supabase functions serve plant-details
 ```
 
+## Plant counts by county
+
+`GET /functions/v1/count-plants-by-county?lifeCycle=perennial&edible=true`
+returns the number of matching plants in every county recorded in `county_info`:
+
+```json
+[{"fips":1001,"plant_count":12},{"fips":1003,"plant_count":0}]
+```
+
+The endpoint accepts the same name and trait filters as `search-plants`, except
+`page` and `pageSize`, which are rejected. Omit all filters to count every linked
+plant. Counts cover all matches, include zero-match counties, and are sorted by
+numeric FIPS. Each plant contributes at most once per county, even when multiple
+common names match. A plant linked to multiple counties contributes to each one.
+An empty county table returns `[]`. FIPS are integers; use
+`String(row.fips).padStart(5, '0')` if your map uses five-character FIPS keys.
+
+```js
+const params = new URLSearchParams({ lifeCycle: 'perennial', edible: 'true' });
+const response = await fetch(
+  `${supabaseUrl}/functions/v1/count-plants-by-county?${params}`,
+  { headers: { apikey: publishableKey } }
+);
+if (!response.ok) throw new Error((await response.json()).error ?? 'County count failed');
+const countsByCounty = await response.json();
+```
+
+Apply `supabase/migrations/202610240010_count_plants_by_county.sql` after migrations
+008 and 009. The migration shares validation and matching predicates between
+`search_plants` and the new `count_plants_by_county(p_filters jsonb)` RPC while
+preserving search pagination. Counts are grouped in the database; plant IDs and
+individual county links are not returned to the frontend. Both RPCs are read-only
+SECURITY DEFINER functions with empty search paths; helpers stay in the private
+schema, and no additional table access is granted.
+
+Deploy the new function from this checkout so the CLI bundles the shared parser:
+
+```sh
+npx supabase functions deploy count-plants-by-county --no-verify-jwt
+```
+
+For Dashboard deployment, include `index.ts`, `handler.ts`, `query.ts`, and the
+imported `../_shared/plant-search-query.ts` file, preserving the relative paths.
+The search function now imports that same shared file through its `query.ts`;
+include it when redeploying search as well. No login is required. Send the project
+publishable key in `apikey` and keep JWT verification off, as configured in
+`supabase/config.toml`. This endpoint uses the same best-effort 120 requests/minute/IP
+runtime throttle and short public response caching as search. Direct RPC calls
+bypass the Edge throttle. See its [request/response specification](supabase/functions/count-plants-by-county/SPEC.md).
+
+The map calls this endpoint for each submitted search. Selecting a county calls
+`search-plants` with that county's FIPS and the same submitted filters, then loads
+plant details in pages of 20. Further pages are available through **Load more
+species**. Editing a name or filter without submitting does not change the active
+map or county search. Changing counties, starting a search, and closing the
+sidebar cancel obsolete sidebar requests.
+
+Apply `supabase/migrations/202610240011_search_county.sql` after migration 010 and
+redeploy `search-plants` to enable county selection in the frontend.
+
+Then apply `supabase/migrations/202610240012_count_query_plan.sql`. It evaluates
+plant filters once before joining county links and searches common names as a
+set. This avoids the slow join plan that approached the anonymous role's
+three-second SQL timeout and could surface as a 502. It also preserves sun filtering
+for databases storing either a scalar sun value or multiple sun values. The Edge
+Functions log the upstream database error code on RPC failure without returning
+private database details to clients.
+
+To serve locally after applying the migrations:
+
+```sh
+npx supabase functions serve count-plants-by-county
+```
+
 ## County lookup
 
 `POST /functions/v1/plant-counties` accepts a JSON body:
@@ -110,11 +184,13 @@ whitespace normalization. Omitting it browses a bounded page of plants. Optional
 | `isWoody`, `isTree`, `edible`, `thorns` | `true` or `false` |
 | `minHeight`, `maxHeight`, `minWidth`, `maxWidth` | Whole inches, 0–32767 |
 | `page`, `pageSize` | Default 1 and 50; maximum 1000 and 100 |
+| `county` | One county FIPS code, 1–99999; five-digit codes such as `01001` are accepted |
 
 Pass enum selections as comma-separated values, for example
 `?search=oak&lifeCycle=perennial,annual&isWoody=true&minHeight=12&maxHeight=72`.
 Selections within a group are combined with OR; different groups use AND.
 Measurement intervals overlap the plant's recorded range, including endpoints.
+County selection is combined with the name and trait filters before pagination.
 Omitted filters impose no restriction; an active filter excludes unknown values
 for the fields it compares. Parameters may appear only once. Unknown parameters,
 invalid options, and minimums greater than maximums return HTTP 400.
@@ -145,7 +221,7 @@ responses allow short public caching.
 For an existing hosted project with the name search RPC:
 
 1. Apply migration 008 (inches/water arrays), then `supabase/migrations/202610240009_search_water_pagination.sql`. The latter supersedes the earlier search-filter function. The MOBOT `prepare` command runs both 008 and 009 after taking a backup; do not run it until the current feet-based import has finished.
-2. Redeploy `search-plants`, including `index.ts`, `handler.ts`, and `query.ts`.
+2. For the county map and county-specific plant lists, apply migrations 010, 011, and 012, then deploy `count-plants-by-county` and redeploy `search-plants`. Include `index.ts`, `handler.ts`, `query.ts`, and the imported `../_shared/plant-search-query.ts` file for each. CLI deployment bundles the shared file automatically.
 3. Keep JWT verification off in the Dashboard (matching `config.toml`).
 
 The SQL update replaces the existing RPC while preserving its argument and return
@@ -195,6 +271,73 @@ Local endpoints avoid Windows reserved ports: functions/API at
 For a new database, the migration chain creates the supplied plant, county, and
 common-name tables, with INTEGER FIPS columns. Do not run the initial CREATE TABLE
 migration against an existing schema without reconciling it first.
+
+## Local SQL backups
+
+With Docker Desktop running and `npm ci` completed, export the linked hosted
+database from `backend/`:
+
+```sh
+npm run db:dump
+```
+
+The script uses the installed, lockfile-pinned CLI through
+`npx --no-install supabase db dump`. The CLI creates disposable Supabase Postgres
+containers to run `pg_dump` against the live source database. A separate local
+database server is not required for hosted exports, and the source is only read.
+Use `npx supabase login` and `npx supabase link --project-ref YOUR_PROJECT_REF`
+first if this checkout is not already linked. The CLI uses its saved credentials;
+`SUPABASE_DB_PASSWORD` can supply the database password when needed. To export a
+different database, set `SUPABASE_DB_URL` to its percent-encoded PostgreSQL
+connection string (use the session pooler on IPv4-only networks).
+
+Each successful run writes a new `backups/rootfind-<timestamp>-<suffix>/` containing
+`roles.sql`, `schema.sql`, `data.sql`, and a combined **`rootfind.sql`**. Dumps are
+ignored by Git and created with private file permissions. Failed exports do not
+publish a completed backup. Roles, schema, and data are exported separately, so
+avoid schema changes while a backup runs; this is not a single coordinated
+snapshot across all three commands.
+
+To export an existing local Supabase database instead:
+
+```sh
+npx supabase db start
+npm run db:dump -- --local
+```
+
+Restore the combined file into a **fresh Supabase database** with its built-in
+roles and managed schemas already initialized (not an empty vanilla Postgres
+server). With `psql` available and `LOCAL_DB_URL` pointing to that fresh target
+using an administrator role able to restore role settings and parameter grants:
+
+```sh
+psql "$LOCAL_DB_URL" --single-transaction --variable ON_ERROR_STOP=1 \
+  --file backups/rootfind-<timestamp>-<suffix>/rootfind.sql
+```
+
+The local copy created during setup uses the isolated project at `backups/local`,
+container `supabase_db_rootfind-backup`, and Postgres port **15432**. Restore into
+that container with its `supabase_admin` role:
+
+```sh
+docker exec -i supabase_db_rootfind-backup psql -U supabase_admin -d postgres \
+  --single-transaction --variable ON_ERROR_STOP=1 \
+  < backups/rootfind-<timestamp>-<suffix>/rootfind.sql
+```
+
+Run a restore only against a fresh target; the copy already contains the restored
+tables. To stop or resume this local database without removing its saved data:
+
+```sh
+npx supabase stop --workdir backups/local
+npx supabase db start --workdir backups/local
+```
+
+The backup follows [Supabase's CLI backup workflow](https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore).
+The CLI omits Supabase-managed schema definitions and migration history by default;
+custom changes inside managed schemas need separate handling. Storage file
+contents, Edge Function code, and project settings are not included. Vector
+bucket/index metadata is excluded as recommended by Supabase.
 
 ## Tests
 
