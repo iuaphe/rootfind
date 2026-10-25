@@ -155,6 +155,9 @@ and numeric measurements in `p_filters`, for example
 
 No hosted migration or deployment is performed by editing these files.
 
+NC State and PFAF importers: see [catalog enrichment](scripts/CATALOG_ENRICHMENT.md)
+for migration 010, source samples, and progressive live updates.
+
 ## USDA importer checkpoints
 
 The streaming importer records version-2 JSON events at the existing progress
