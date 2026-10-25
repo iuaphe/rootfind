@@ -42,6 +42,8 @@ and releases its WebGL context, workers, event listeners, resize observer, and
 pending fetch when unmounted.
 
 The data is copied from `data-processing/output/counties.geojson` to
-`src/lib/data/counties.geojson`; types are copied from `data-processing/types.ts`
-to `src/lib/types/counties.ts`. Refresh both copies if the extraction schema changes.
-The boundaries reflect 2018 geography and include county equivalents and territories.
+`src/lib/data/counties.geojson`; the frontend copy rounds geometry coordinates to
+five decimal places (about one meter) to reduce its download size. Types are copied
+from `data-processing/types.ts` to `src/lib/types/counties.ts`. When refreshing the
+data, preserve this rounding in the frontend copy. The boundaries reflect 2018
+geography and include county equivalents and territories.
