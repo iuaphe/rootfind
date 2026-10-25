@@ -58,7 +58,7 @@ test('MOBOT migration converts feet once, preserves water, merges ranges, and au
     const scripts = fileURLToPath(new URL('../scripts/', import.meta.url));
     const { stdout } = await exec(process.platform === 'win32' ? 'python' : 'python3', [
       '-c', 'import sys,json; sys.path.insert(0,sys.argv[1]); import enrich_mobot; print(enrich_mobot.build_apply_sql(json.loads(sys.argv[2]), "test-run"))',
-      scripts, JSON.stringify(records),
+      scripts, JSON.stringify([...records, records[0]]),
     ], { env: { ...process.env, PYTHONUTF8: '1' } });
     assert.equal((await db.exec(stdout)).at(-1)?.rows[0].updated_count, 1);
     const updated = (await db.query<{ plant: Record<string, unknown> }>('select to_jsonb(p) as plant from public.plants p where plant_id=1')).rows[0].plant;

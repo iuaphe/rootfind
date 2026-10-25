@@ -1,7 +1,7 @@
 # count-plants-by-county
 
 Count all matching plants per recorded county in one database query. Requires
-`202610240010_count_plants_by_county.sql`, following migrations 008 and 009.
+`202610240014_count_plants_by_county.sql`, following migrations 008–013.
 
 ## Request
 

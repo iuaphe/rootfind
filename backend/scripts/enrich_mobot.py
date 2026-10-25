@@ -247,7 +247,7 @@ class Fetcher:
         self.host = urllib.parse.urlparse(base_url).hostname
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
-        self.delay = max(1.0, delay)
+        self.delay = max(0.0, delay)
         self.last_request = 0.0
         self.request_lock = threading.Lock()
         self.stopped = threading.Event()
@@ -335,7 +335,18 @@ class Database:
     def __init__(self, directory: Path, project_ref: str | None = None):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.project_ref = project_ref or (BACKEND / 'supabase/.temp/project-ref').read_text().strip()
+        if not project_ref:
+            ref_path = BACKEND / 'supabase/.temp/project-ref'
+            if ref_path.exists():
+                self.project_ref = ref_path.read_text().strip()
+            else:
+                json_path = BACKEND / 'supabase/.temp/linked-project.json'
+                if json_path.exists():
+                    self.project_ref = json.loads(json_path.read_text()).get('ref', '')
+                else:
+                    raise RuntimeError('No linked project found')
+        else:
+            self.project_ref = project_ref
         if not re.fullmatch(r'[a-z0-9]{20}', self.project_ref):
             raise ValueError('Unexpected project reference')
         self.cli = BACKEND / 'node_modules/supabase/dist/supabase.js'
@@ -369,7 +380,7 @@ class Database:
         units = 'inches' if metadata[0]['dimension_comment'] == 'Unit: inches (MOBOT enrichment v1)' else 'feet'
         plants, last_id = [], 0
         while True:
-            result = self.query(f'select to_jsonb(p) as plant from public.plants p where plant_id > {last_id} order by plant_id limit 1000')
+            result = self.query(f'select to_jsonb(p) as plant from public.plants p where plant_id > {last_id} order by plant_id limit 10000')
             rows = [row['plant'] for row in result]
             if not rows:
                 break
@@ -415,6 +426,8 @@ class LiveWriter:
                 or record.get('parser_version') != PARSER_VERSION
                 or not scientific_match(record['scientific_name'], record.get('source_name'))):
             raise ValueError('Live update rejected a stale or mismatched source record')
+        if any(item['plant_id'] == record['plant_id'] for item in self.pending):
+            return
         self.pending.append(record)
         if len(self.pending) >= self.batch_size:
             self.flush()
@@ -595,7 +608,7 @@ def build_apply_sql(records: list[dict], run_id: str) -> str:
     run = sql_literal(run_id)
     return f"""set standard_conforming_strings = on;
     with incoming as (
-      select * from jsonb_to_recordset({payload}::jsonb) as r(
+      select distinct on (plant_id) * from jsonb_to_recordset({payload}::jsonb) as r(
         plant_id integer, scientific_name text, source_url text,
         min_zone smallint, max_zone smallint, minheight smallint, maxheight smallint,
         minwidth smallint, maxwidth smallint, water public.water_level_enum[], bloom_months public.month_enum[])
@@ -620,7 +633,8 @@ def build_apply_sql(records: list[dict], run_id: str) -> str:
       returning p.plant_id, to_jsonb(p) as new_row, b.old_row, s.source_url
     ), audited as (
       insert into rootfind_private.mobot_changes(run_id, plant_id, source_url, old_row, new_row)
-      select {run}, plant_id, source_url, old_row, new_row from updated returning plant_id
+      select {run}, plant_id, source_url, old_row, new_row from updated
+      on conflict (run_id, plant_id) do nothing returning plant_id
     ) select count(*)::integer as updated_count,
       (count(*) + (select count(*) from rootfind_private.mobot_changes a
         join incoming s on s.plant_id = a.plant_id
