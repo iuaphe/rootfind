@@ -29,3 +29,4 @@ __pycache__/
 *.pyc
 .usda_cache/
 .mobot/
+.enrichment/

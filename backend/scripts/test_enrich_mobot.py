@@ -1,9 +1,13 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
+import io
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import enrich_mobot as mobot
 
@@ -86,6 +90,186 @@ class TestParsing(unittest.TestCase):
 
 
 class TestCollection(unittest.TestCase):
+    def test_failed_searches_print_requested_and_returned_names_and_urls_on_resume(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            class FakeDB:
+                project_ref = 'a' * 20
+                def snapshot(self, _label):
+                    return {'plants': [
+                        {'plant_id': 1, 'genus': 'Acer', 'species': 'rubrum'},
+                        {'plant_id': 2, 'genus': 'Missing', 'species': 'plant'},
+                    ], 'dimension_unit': 'inches'}
+            class FakeFetcher:
+                def __init__(self, *_args): pass
+                def get(self, url):
+                    if 'basic=Missing' in url:
+                        return '<html>PlantFinder: no results</html>'
+                    if 'ProfileResults' in url:
+                        return '<a href="/PlantFinderDetails.aspx?taxonid=1">Robinia pseudoacacia</a>'
+                    return detail_html(**{'Zone': '3 to 8'})
+            args = argparse.Namespace(directory=directory, delay=1, limit=None, retry=False, workers=2)
+            with patch.object(mobot, 'Fetcher', FakeFetcher):
+                for resumed in [False, True]:
+                    with patch('sys.stdout', new_callable=io.StringIO) as output:
+                        mobot.collect(FakeDB(), args)
+                    text = output.getvalue()
+                    prefix = 'resumed ' if resumed else ''
+                    self.assertIn(f'[{prefix}name_mismatch] plant_id=1', text)
+                    self.assertIn("searched='Acer rubrum'", text)
+                    self.assertIn("First result label: 'Robinia pseudoacacia'", text)
+                    self.assertIn("Detail scientific name: 'Robinia pseudoacacia'", text)
+                    self.assertIn('basic=Acer%20rubrum', text)
+                    self.assertIn('taxonid=1', text)
+                    self.assertIn(f'[{prefix}no_match] plant_id=2', text)
+                    self.assertIn('no PlantFinder detail link returned', text)
+
+    def test_workers_share_request_spacing_and_stop_before_new_requests(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(mobot.Fetcher, 'get', return_value=''):
+                fetcher = mobot.Fetcher(Path(temp), 1)
+            fetcher.delay = 0.03
+            starts = []
+            def open_page(request, **kwargs):
+                starts.append(time.monotonic())
+                response = MagicMock()
+                response.__enter__.return_value = response
+                response.url = request.full_url
+                response.headers.get_content_charset.return_value = 'utf-8'
+                response.read.return_value = b'Web Page Blocked' if request.full_url.endswith('/blocked') else b'<html>PlantFinder</html>'
+                return response
+            with patch.object(mobot.urllib.request, 'urlopen', side_effect=open_page) as open_url:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    list(pool.map(fetcher.get, [mobot.BASE_URL + f'/test-{i}' for i in range(4)]))
+                self.assertEqual(len(starts), 4)
+                self.assertTrue(all(b - a >= 0.025 for a, b in zip(starts, starts[1:])), starts)
+                # Cache hits consume no network request or pacing slot.
+                fetcher.get(mobot.BASE_URL + '/test-0')
+                self.assertEqual(open_url.call_count, 4)
+                with self.assertRaises(mobot.WebsiteBlocked):
+                    fetcher.get(mobot.BASE_URL + '/blocked')
+                self.assertTrue(fetcher.stopped.is_set())
+                with self.assertRaises(mobot.WebsiteBlocked):
+                    fetcher.get(mobot.BASE_URL + '/new')
+                self.assertEqual(open_url.call_count, 5)
+
+    def test_parallel_collection_writes_complete_resumable_records(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            plants = [{'plant_id': i, 'genus': 'Robinia', 'species': 'pseudoacacia'} for i in range(1, 5)]
+            writes = []
+            class FakeDB:
+                project_ref = 'a' * 20
+                def snapshot(self, _label):
+                    return {'plants': plants, 'dimension_unit': 'inches'}
+                def query(self, sql):
+                    writes.append(sql)
+                    return [{'updated_count': 4}]
+            active = peak = 0
+            lock = threading.Lock()
+            class FakeFetcher:
+                def __init__(self, *_args): pass
+                def get(self, url):
+                    nonlocal active, peak
+                    with lock:
+                        active += 1
+                        peak = max(active, peak)
+                    try:
+                        time.sleep(0.02)
+                        if 'ProfileResults' in url:
+                            return '<a href="/PlantFinderDetails.aspx?taxonid=1">Robinia pseudoacacia</a>'
+                        return detail_html(**{'Zone': '3 to 8'})
+                    finally:
+                        with lock:
+                            active -= 1
+            args = argparse.Namespace(directory=directory, delay=1, limit=None, retry=False, workers=4)
+            with patch.object(mobot, 'Fetcher', FakeFetcher):
+                mobot.collect(FakeDB(), args)
+                self.assertGreater(peak, 1)
+                records = list(mobot.read_plan(directory / 'plan.jsonl').values())
+                self.assertEqual({row['plant_id'] for row in records}, {1, 2, 3, 4})
+                self.assertTrue(all(row['status'] == 'matched' for row in records))
+                mobot.collect(FakeDB(), args)
+                self.assertEqual(len((directory / 'plan.jsonl').read_text().splitlines()), 4)
+                # Switching an existing read-only collection to live mode must
+                # apply its saved matches, even with no new pages to collect.
+                args.apply_live = True
+                mobot.collect(FakeDB(), args)
+                self.assertEqual(len(writes), 1)
+                self.assertTrue(all(record['live_applied'] for record in mobot.read_plan(directory / 'plan.jsonl').values()))
+                mobot.collect(FakeDB(), args)
+                self.assertEqual(len(writes), 1, 'confirmed live commits must not be retried')
+
+    def test_live_writer_checkpoints_only_confirmed_commits_and_retries_failures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'plan.jsonl'
+            record = {'plant_id': 1, 'scientific_name': 'Robinia pseudoacacia',
+                      'source_name': 'Robinia pseudoacacia', 'source_url': mobot.BASE_URL,
+                      'parser_version': mobot.PARSER_VERSION, 'project_ref': 'a' * 20,
+                      'status': 'matched', 'patch': {'min_zone': 3}}
+            path.write_text(json.dumps(record) + '\n', encoding='utf-8')
+            db = MagicMock(project_ref='a' * 20)
+            with path.open('a', encoding='utf-8') as out:
+                writer = mobot.LiveWriter(db, out, batch_size=1)
+                db.query.side_effect = RuntimeError('database unavailable')
+                with self.assertRaisesRegex(RuntimeError, 'database unavailable'):
+                    writer.add(record)
+                self.assertEqual(len(writer.pending), 1)
+                self.assertNotIn('live_applied', next(iter(mobot.read_plan(path).values())))
+                db.query.side_effect = None
+                db.query.return_value = [{'updated_count': None}]
+                with self.assertRaisesRegex(RuntimeError, 'no confirmed result'):
+                    writer.flush()
+                self.assertNotIn('live_applied', next(iter(mobot.read_plan(path).values())))
+                db.query.return_value = [{'updated_count': 0, 'confirmed_count': 0}]
+                with self.assertRaisesRegex(RuntimeError, 'did not confirm every record'):
+                    writer.flush()
+                self.assertEqual(len(writer.pending), 1)
+                self.assertNotIn('live_applied', next(iter(mobot.read_plan(path).values())))
+                # A replay can confirm an earlier commit from its durable audit row.
+                db.query.return_value = [{'updated_count': 0, 'confirmed_count': 1}]
+                writer.flush()
+                self.assertEqual(writer.pending, [])
+                self.assertTrue(next(iter(mobot.read_plan(path).values()))['live_applied'])
+                calls = db.query.call_count
+                writer.flush()
+                self.assertEqual(db.query.call_count, calls)
+
+    def test_new_live_collection_commits_before_collection_finishes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            state = {'fetched': 0, 'commits': []}
+            plants = [{'plant_id': i, 'genus': 'Robinia', 'species': 'pseudoacacia'} for i in range(1, 13)]
+            class FakeDB:
+                project_ref = 'a' * 20
+                def snapshot(self, _label):
+                    return {'plants': plants, 'dimension_unit': 'inches'}
+                def query(self, _sql):
+                    state['commits'].append(state['fetched'])
+                    return [{'updated_count': 10 if len(state['commits']) == 1 else 2}]
+            class FakeFetcher:
+                def __init__(self, *_args): pass
+                def get(self, url):
+                    if 'ProfileResults' in url:
+                        state['fetched'] += 1
+                        return '<a href="/PlantFinderDetails.aspx?taxonid=1">Robinia pseudoacacia</a>'
+                    return detail_html(**{'Zone': '3 to 8'})
+            args = argparse.Namespace(directory=directory, delay=1, limit=None, retry=False, workers=1, apply_live=True)
+            with patch.object(mobot, 'Fetcher', FakeFetcher):
+                mobot.collect(FakeDB(), args)
+            self.assertEqual(state['commits'], [10, 12])
+            self.assertTrue(all(record['live_applied'] for record in mobot.read_plan(directory / 'plan.jsonl').values()))
+
+    def test_cli_rows_accept_user_and_agent_output_including_empty_results(self):
+        rows = [{'plant': {'plant_id': 1, 'water': ['medium']}}]
+        for result in [rows, {'boundary': 'example', 'rows': rows}, [], {'rows': []}]:
+            with self.subTest(result=result):
+                self.assertEqual(mobot.parse_cli_rows('Initialising login role...\n' + json.dumps(result)),
+                                 result['rows'] if isinstance(result, dict) else result)
+        for output in ['No results', '{"rows": null}', '[1, 2]', '{"error": "query failed"}']:
+            with self.subTest(output=output), self.assertRaisesRegex(RuntimeError, 'no recognized JSON rows'):
+                mobot.parse_cli_rows(output)
+
     def test_apply_rejects_old_plans_and_suffix_matches_even_if_marked_matched(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

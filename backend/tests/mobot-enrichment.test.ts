@@ -19,6 +19,9 @@ test('taxonomy writes reject anon and the view survives water conversion and rer
   const db = new PGlite();
   try {
     await setup(db);
+    // A manual SQL Editor run may have created the table, policy, and view
+    // without recording this migration in Supabase's history.
+    await db.exec(await migration('20261024000702_plant_taxonomy.sql'));
     await db.exec("insert into public.plants(genus,species,water) values ('Acer','rubrum','med'); set role anon;");
     await assert.rejects(db.query("select public.upsert_plant_taxonomy(1, '{\"family\":\"Wrong\"}'::jsonb)"), /permission denied/);
     await db.exec("reset role; set role authenticated; select public.upsert_plant_taxonomy(1, '{\"family\":\"Sapindaceae\"}'::jsonb); reset role;");
