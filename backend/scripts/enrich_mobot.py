@@ -415,6 +415,8 @@ class LiveWriter:
                 or record.get('parser_version') != PARSER_VERSION
                 or not scientific_match(record['scientific_name'], record.get('source_name'))):
             raise ValueError('Live update rejected a stale or mismatched source record')
+        if any(item['plant_id'] == record['plant_id'] for item in self.pending):
+            return
         self.pending.append(record)
         if len(self.pending) >= self.batch_size:
             self.flush()
@@ -595,7 +597,7 @@ def build_apply_sql(records: list[dict], run_id: str) -> str:
     run = sql_literal(run_id)
     return f"""set standard_conforming_strings = on;
     with incoming as (
-      select * from jsonb_to_recordset({payload}::jsonb) as r(
+      select distinct on (plant_id) * from jsonb_to_recordset({payload}::jsonb) as r(
         plant_id integer, scientific_name text, source_url text,
         min_zone smallint, max_zone smallint, minheight smallint, maxheight smallint,
         minwidth smallint, maxwidth smallint, water public.water_level_enum[], bloom_months public.month_enum[])
@@ -620,7 +622,8 @@ def build_apply_sql(records: list[dict], run_id: str) -> str:
       returning p.plant_id, to_jsonb(p) as new_row, b.old_row, s.source_url
     ), audited as (
       insert into rootfind_private.mobot_changes(run_id, plant_id, source_url, old_row, new_row)
-      select {run}, plant_id, source_url, old_row, new_row from updated returning plant_id
+      select {run}, plant_id, source_url, old_row, new_row from updated
+      on conflict (run_id, plant_id) do nothing returning plant_id
     ) select count(*)::integer as updated_count,
       (count(*) + (select count(*) from rootfind_private.mobot_changes a
         join incoming s on s.plant_id = a.plant_id
