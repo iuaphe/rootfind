@@ -38,6 +38,7 @@ create index if not exists plant_taxonomy_lineage_gin on public.plant_taxonomy u
 -- 3. Row Level Security
 alter table public.plant_taxonomy enable row level security;
 grant select on public.plant_taxonomy to anon, authenticated;
+drop policy if exists plant_taxonomy_read on public.plant_taxonomy;
 create policy plant_taxonomy_read on public.plant_taxonomy for select to anon, authenticated using (true);
 
 do $$ begin

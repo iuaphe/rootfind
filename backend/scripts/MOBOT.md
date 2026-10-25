@@ -1,9 +1,20 @@
 # MOBOT enrichment
 
 This script uses the linked Supabase project's existing CLI login. There are no
-embedded passwords, API keys, fixed plant counts, or new Python dependencies.
+embedded passwords, API keys, or fixed plant counts.
 Python 3.10+ and Node 24+ with `npm ci` in `backend/` are required. Run commands
 below from `backend/`.
+
+If Python reports `CERTIFICATE_VERIFY_FAILED`, install the optional native trust
+store integration using the same interpreter that runs collection:
+
+```powershell
+..\.venv\Scripts\python.exe -m pip install truststore
+```
+
+When installed, it uses the operating system's certificate verification (Windows
+CryptoAPI on Windows); otherwise Python's default verified TLS context is used.
+Certificate and hostname verification remain enabled in both cases.
 
 **Finish the current USDA import first. Do not run prepare/apply while another
 process is inserting feet-based rows or replaying old generated SQL.**
@@ -30,6 +41,28 @@ passes this project reference to every CLI database query.
 python scripts/enrich_mobot.py collect
 ```
 
+To update Supabase progressively during collection (after migrations 008/009),
+stop any other collector first and run:
+
+```powershell
+..\.venv\Scripts\python.exe scripts/enrich_mobot.py collect --apply-live --workers 4 --delay 1
+```
+
+This explicitly enables writes. Matched records commit in batches of 10, or on
+the next main-loop check after 30 seconds, with a final smaller batch at normal
+completion. The initial backup is still taken. Previously collected matches
+without a confirmed live checkpoint are applied on startup, so switching from
+read-only collection does not lose that work. Scientific-name matching, current
+database range/water merges, and the private before/after audit also apply here.
+
+Each committed batch prints `Live Supabase commit`. Confirmed batches remain in
+Supabase if the program stops. Uncommitted records remain in the local plan and
+are retried when restarting the same live command. A failed database write stops
+collection without marking the batch complete. If interruption occurs between
+a database commit and its local checkpoint, replay uses the audit/run ID to
+skip the same batch; differently grouped batches can merge again safely.
+Do not run collect/apply concurrently against the same plan directory.
+
 Each run reads the plant list afresh. If more plants are added, rerun this command;
 completed existing plant/name combinations are skipped and new ones are included.
 There is no hardcoded count or maximum plant ID. A collection run ends after the
@@ -44,9 +77,19 @@ silently switch to a different result. Missing search results do not delete or
 clear anything. Unrecognized field wording is logged and that field is left
 unchanged. No HTML, script, or page text is executed as instructions.
 
-Collection is sequential, caches pages, waits at least 1.5 seconds between
-requests by default, and respects a larger robots.txt crawl delay. `--delay 3`
-slows requests further. A 403/429, firewall, or challenge stops the run instead of
+Failed matches print individually to the console: plant ID, searched scientific
+name, first-result link label, detail-page scientific name, and search/result URLs.
+No-result searches, parse problems, request errors, and blocks also print their
+status and available diagnostics. Resumed failures print with a `resumed` prefix;
+their full records remain in `plan.jsonl`.
+
+Collection uses four workers by default to overlap slow responses. All workers
+and retries share a single request limiter: at least one second between request
+starts, or a larger robots.txt crawl delay. Use `--workers 1` for sequential
+collection or `--workers 8` for more overlap; this does not raise the request rate.
+`--delay 3` slows requests further. Pages remain cached and only the main thread
+writes complete plan records. A 403/429, firewall, or challenge stops new requests
+across workers instead of
 attempting a bypass. Fix access with the site before resuming. HTTP 404 robots.txt
 means no robots directives were found, not that the website grants reuse rights.
 

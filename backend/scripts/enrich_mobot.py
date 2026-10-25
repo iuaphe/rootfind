@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Resumable MOBOT enrichment. Collection is read-only; prepare/apply are explicit.
+"""Resumable MOBOT enrichment. Collection is read-only unless --apply-live is set.
 
 Uses the repo's installed Supabase CLI and existing login, never an embedded key.
-Run --help, or see scripts/MOBOT.md. Requires only Python's standard library.
+Run --help, or see scripts/MOBOT.md. Optional truststore uses native TLS verification.
 """
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import hashlib
 from html.parser import HTMLParser
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -87,7 +91,7 @@ class PlantHTML(HTMLParser):
 
 def check_page(html: str):
     if re.search(r'Web Page Blocked|Attack ID:|Access Denied|captcha', html, re.I):
-        raise WebsiteBlocked('MOBOT returned a firewall/challenge page; stopped without bypassing it')
+        raise WebsiteBlocked('Source returned a firewall/challenge page; stopped without bypassing it')
 
 
 def first_result(html: str) -> dict | None:
@@ -229,14 +233,27 @@ class WebsiteBlocked(RuntimeError):
     pass
 
 
+def create_tls_context():
+    try:
+        import truststore
+    except ImportError:
+        return ssl.create_default_context()
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 class Fetcher:
-    def __init__(self, directory: Path, delay: float):
+    def __init__(self, directory: Path, delay: float, base_url=BASE_URL):
+        self.base_url = base_url
+        self.host = urllib.parse.urlparse(base_url).hostname
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
         self.delay = max(1.0, delay)
         self.last_request = 0.0
+        self.request_lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.tls_context = create_tls_context()
         self.robots = urllib.robotparser.RobotFileParser()
-        robots_url = BASE_URL + '/robots.txt'
+        robots_url = self.base_url + '/robots.txt'
         try:
             self.robots.parse(self.get(robots_url, robots_check=False).splitlines())
         except urllib.error.HTTPError as error:
@@ -249,8 +266,17 @@ class Fetcher:
             self.delay = max(self.delay, float(crawl_delay))
 
     def get(self, url: str, robots_check=True) -> str:
+        if self.stopped.is_set():
+            raise WebsiteBlocked('Collection stopped after a blocked request')
+        try:
+            return self._get(url, robots_check)
+        except WebsiteBlocked:
+            self.stopped.set()
+            raise
+
+    def _get(self, url: str, robots_check=True) -> str:
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != 'https' or parsed.hostname != 'plantfinder.mobot.org':
+        if parsed.scheme != 'https' or parsed.hostname != self.host:
             raise ValueError('Unexpected source host')
         if robots_check and not self.robots.can_fetch('RootfindPlantEnrichment', url):
             raise WebsiteBlocked('robots.txt disallows this URL')
@@ -260,12 +286,16 @@ class Fetcher:
             check_page(text)
             return text
         for attempt in range(3):
-            time.sleep(max(0.0, self.delay - (time.monotonic() - self.last_request)))
-            self.last_request = time.monotonic()
+            request = urllib.request.Request(url, headers={'User-Agent': 'RootfindPlantEnrichment/1.0'})
+            # All workers share one request-start budget, including retries.
+            with self.request_lock:
+                remaining = max(0.0, self.delay - (time.monotonic() - self.last_request))
+                if self.stopped.wait(remaining):
+                    raise WebsiteBlocked('Collection stopped after a blocked request')
+                self.last_request = time.monotonic()
             try:
-                request = urllib.request.Request(url, headers={'User-Agent': 'RootfindPlantEnrichment/1.0'})
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    if urllib.parse.urlparse(response.url).hostname != 'plantfinder.mobot.org':
+                with urllib.request.urlopen(request, timeout=30, context=self.tls_context) as response:
+                    if urllib.parse.urlparse(response.url).hostname != self.host:
                         raise WebsiteBlocked('Unexpected redirect host')
                     text = response.read(5_000_001)
                     if len(text) > 5_000_000:
@@ -276,7 +306,7 @@ class Fetcher:
                 return text
             except urllib.error.HTTPError as error:
                 if error.code in {401, 403, 429}:
-                    raise WebsiteBlocked(f'MOBOT HTTP {error.code}; stopped, retry later with permission') from error
+                    raise WebsiteBlocked(f'{self.host} HTTP {error.code}; stopped, resolve access before resuming') from error
                 if error.code < 500 or attempt == 2:
                     raise
                 time.sleep(2 ** (attempt + 1))
@@ -285,6 +315,20 @@ class Fetcher:
                     raise
                 time.sleep(2 ** (attempt + 1))
         raise RuntimeError('Fetch attempts exhausted')
+
+
+def parse_cli_rows(stdout: str) -> list[dict]:
+    # Agent mode wraps results in {rows: [...]}; normal CLI mode returns [...].
+    # Login notices may precede either representation.
+    for match in re.finditer(r'[\[{]', stdout):
+        try:
+            output, _ = json.JSONDecoder().raw_decode(stdout[match.start():])
+        except json.JSONDecodeError:
+            continue
+        rows = output.get('rows') if isinstance(output, dict) else output
+        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+            return rows
+    raise RuntimeError('Supabase CLI returned no recognized JSON rows; expected a row array or an object containing rows')
 
 
 class Database:
@@ -308,15 +352,7 @@ class Database:
             ], cwd=BACKEND, capture_output=True, text=True, encoding='utf-8', timeout=180)
             if result.returncode:
                 raise RuntimeError('Supabase query failed: ' + result.stderr[-1000:])
-            # The CLI may print a login-role notice before its JSON result.
-            for match in re.finditer(r'\{', result.stdout):
-                try:
-                    output, _ = json.JSONDecoder().raw_decode(result.stdout[match.start():])
-                    if isinstance(output, dict) and 'rows' in output:
-                        return output['rows']
-                except json.JSONDecodeError:
-                    pass
-            raise RuntimeError('Supabase CLI returned no recognized JSON rows')
+            return parse_cli_rows(result.stdout)
         finally:
             path.unlink(missing_ok=True)
 
@@ -363,54 +399,189 @@ def read_plan(path: Path) -> dict[tuple, dict]:
     return records
 
 
+class LiveWriter:
+    """Checkpoint confirmed commits; leave failures in the plan for retry."""
+    def __init__(self, db, out, batch_size=10, build_sql=None):
+        self.db, self.out, self.batch_size = db, out, batch_size
+        self.build_sql = build_sql or build_apply_sql
+        self.pending = []
+        self.last_flush = time.monotonic()
+        self.updated = 0
+
+    def add(self, record):
+        if record['status'] != 'matched' or record.get('live_applied'):
+            return
+        if (record.get('project_ref') != self.db.project_ref
+                or record.get('parser_version') != PARSER_VERSION
+                or not scientific_match(record['scientific_name'], record.get('source_name'))):
+            raise ValueError('Live update rejected a stale or mismatched source record')
+        self.pending.append(record)
+        if len(self.pending) >= self.batch_size:
+            self.flush()
+
+    def flush(self):
+        if not self.pending:
+            self.last_flush = time.monotonic()
+            return
+        # Ensure the recovery plan reaches disk before making database changes.
+        self.out.flush()
+        os.fsync(self.out.fileno())
+        content = [{key: record[key] for key in ('plant_id', 'scientific_name', 'source_url', 'patch')}
+                   for record in sorted(self.pending, key=lambda item: item['plant_id'])]
+        run_id = 'live-' + hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+        result = self.db.query(self.build_sql(self.pending, run_id))
+        count = result[0].get('updated_count') if len(result) == 1 else None
+        if type(count) is not int or not 0 <= count <= len(self.pending):
+            raise RuntimeError('Live database update returned no confirmed result; restart to retry')
+        confirmed = result[0].get('confirmed_count', count)
+        if type(confirmed) is not int or confirmed != len(self.pending):
+            raise RuntimeError('Live database update did not confirm every record; no checkpoints written; restart to retry')
+        for record in self.pending:
+            checkpoint = dict(record, live_applied=True, live_applied_at=timestamp())
+            self.out.write(json.dumps(checkpoint, ensure_ascii=False) + '\n')
+        self.out.flush()
+        os.fsync(self.out.fileno())
+        self.updated += count
+        print(f'Live Supabase commit: {count} updated; {self.updated} updated this run.', flush=True)
+        self.pending.clear()
+        self.last_flush = time.monotonic()
+
+
+def report_failed_match(record, resumed=False):
+    if record['status'] == 'matched':
+        return
+    prefix = 'resumed ' if resumed else ''
+    lines = [f"[{prefix}{record['status']}] plant_id={record['plant_id']} searched={record['scientific_name']!r}"]
+    if record['status'] == 'no_match':
+        lines.append('  Result: ' + ('no matching plant profile returned' if record.get('source') else 'no PlantFinder detail link returned'))
+    else:
+        lines.append(f"  First result label: {record.get('selected_name')!r}")
+        lines.append(f"  Detail scientific name: {record.get('source_name')!r}")
+    if record.get('search_url'):
+        lines.append(f"  Search URL: {record['search_url']}")
+    if record.get('source_url'):
+        lines.append(f"  Result URL: {record['source_url']}")
+    if record.get('error'):
+        lines.append(f"  Error: {record['error']}")
+    if record.get('warnings'):
+        lines.append(f"  Warnings: {record['warnings']!r}")
+    print('\n'.join(lines), flush=True)
+
+
 def collect(db: Database, args):
+    adapter = getattr(args, 'source_adapter', None)
     snapshot = db.snapshot('before-collection')
+    live = getattr(args, 'apply_live', False)
+    if live and snapshot['dimension_unit'] != 'inches':
+        raise ValueError('Live updates require migration 008 and dimensions in inches')
     plan_path = args.directory / 'plan.jsonl'
     previous = read_plan(plan_path)
-    fetcher = Fetcher(args.directory / 'cache', args.delay)
+    if any(record.get('project_ref') != db.project_ref for record in previous.values()):
+        raise ValueError('Plan project differs from linked/selected project')
+    if adapter:
+        adapter.validate_snapshot(snapshot)
+        if any(record.get('source') != adapter.name for record in previous.values()):
+            raise ValueError('Plan belongs to a different enrichment source')
+    fetcher = (Fetcher(args.directory / 'cache', args.delay, adapter.base_url) if adapter
+               else Fetcher(args.directory / 'cache', args.delay))
     plants = snapshot['plants'][:args.limit] if args.limit else snapshot['plants']
     counts = {}
-    with plan_path.open('a', encoding='utf-8') as out:
-        for index, plant in enumerate(plants, 1):
-            name = normalize(plant['genus'] + ' ' + plant['species'])
-            key = (plant['plant_id'], name, PARSER_VERSION)
-            existing = previous.get(key)
-            if existing and existing['status'] in {'matched', 'no_match', 'name_mismatch'} and not args.retry:
-                status = 'resumed_' + existing['status']
+
+    def collect_one(plant):
+        name = normalize(plant['genus'] + ' ' + plant['species'])
+        record = {'plant_id': plant['plant_id'], 'scientific_name': name,
+                  'project_ref': db.project_ref, 'parser_version': PARSER_VERSION, 'collected_at': timestamp()}
+        try:
+            if adapter:
+                record['source'] = adapter.name
+                record['search_url'] = record['source_url'] = adapter.profile_url(name)
+                record.update(adapter.lookup(name, fetcher))
+                if record['status'] == 'matched':
+                    record['before'] = {key: plant.get(key) for key in adapter.fields}
+                    record['before_unit'] = snapshot['dimension_unit']
+                    record['after_inches'] = adapter.preview(plant, record['patch'])
+                return record
+            record['search_url'] = BASE_URL + '/PlantFinderProfileResults.aspx?basic=' + urllib.parse.quote(name, safe='')
+            first = first_result(fetcher.get(record['search_url']))
+            if first is None:
+                record['status'] = 'no_match'
             else:
-                record = {'plant_id': plant['plant_id'], 'scientific_name': name,
-                          'project_ref': db.project_ref, 'parser_version': PARSER_VERSION, 'collected_at': timestamp()}
-                try:
-                    record['search_url'] = BASE_URL + '/PlantFinderProfileResults.aspx?basic=' + urllib.parse.quote(name, safe='')
-                    first = first_result(fetcher.get(record['search_url']))
-                    if first is None:
-                        record['status'] = 'no_match'
-                    else:
-                        record.update(source_url=first['url'], selected_name=first['name'])
-                        record.update(parse_details(fetcher.get(first['url'])))
-                        if not scientific_match(name, record['source_name']):
-                            record['status'] = 'name_mismatch'
-                        elif not record['patch']:
-                            record['status'] = 'unparsed'
-                        else:
-                            record['status'] = 'matched'
-                            record['before'] = {key: plant.get(key) for key in [*DIMENSIONS, 'min_zone', 'max_zone', 'water', 'bloom_months']}
-                            record['before_unit'] = snapshot['dimension_unit']
-                            record['after_inches'] = merge_preview(plant, record['patch'], snapshot['dimension_unit'])
-                except WebsiteBlocked as error:
-                    record.update(status='blocked', error=str(error))
+                record.update(source_url=first['url'], selected_name=first['name'])
+                record.update(parse_details(fetcher.get(first['url'])))
+                if not scientific_match(name, record['source_name']):
+                    record['status'] = 'name_mismatch'
+                elif not record['patch']:
+                    record['status'] = 'unparsed'
+                else:
+                    record['status'] = 'matched'
+                    record['before'] = {key: plant.get(key) for key in [*DIMENSIONS, 'min_zone', 'max_zone', 'water', 'bloom_months']}
+                    record['before_unit'] = snapshot['dimension_unit']
+                    record['after_inches'] = merge_preview(plant, record['patch'], snapshot['dimension_unit'])
+        except WebsiteBlocked as error:
+            record.update(status='blocked', error=str(error))
+        except (ValueError, urllib.error.URLError, TimeoutError) as error:
+            record.update(status='error', error=str(error))
+        return record
+
+    pending, unapplied = [], []
+    for plant in plants:
+        name = normalize(plant['genus'] + ' ' + plant['species'])
+        existing = previous.get((plant['plant_id'], name, PARSER_VERSION))
+        if existing and existing['status'] in {'matched', 'no_match', 'name_mismatch'} and not args.retry:
+            report_failed_match(existing, resumed=True)
+            status = 'resumed_' + existing['status']
+            counts[status] = counts.get(status, 0) + 1
+            if live and existing['status'] == 'matched' and not existing.get('live_applied'):
+                unapplied.append(existing)
+        else:
+            pending.append(plant)
+    completed = len(plants) - len(pending)
+    workers = getattr(args, 'workers', 4)
+    print(f'{completed}/{len(plants)} resumed; {len(pending)} pending, {workers} workers, shared request spacing {fetcher.delay if hasattr(fetcher, "delay") else args.delay}s', flush=True)
+    # Only the main thread writes the plan. Keep at most workers tasks in flight.
+    with plan_path.open('a', encoding='utf-8') as out, ThreadPoolExecutor(max_workers=workers) as pool:
+        writer = LiveWriter(db, out, build_sql=adapter.build_sql if adapter else None) if live else None
+        if writer:
+            for record in unapplied:
+                writer.add(record)
+            writer.flush()
+        remaining = iter(pending)
+        futures = {pool.submit(collect_one, plant) for plant in [next(remaining, None) for _ in range(workers)] if plant is not None}
+        try:
+            while futures:
+                done, futures = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
+                blocked = None
+                for future in done:
+                    record = future.result()
                     out.write(json.dumps(record, ensure_ascii=False) + '\n')
                     out.flush()
-                    raise
-                except (ValueError, urllib.error.URLError, TimeoutError) as error:
-                    record.update(status='error', error=str(error))
-                out.write(json.dumps(record, ensure_ascii=False) + '\n')
-                out.flush()
-                status = record['status']
-            counts[status] = counts.get(status, 0) + 1
-            if index == 1 or index % 25 == 0 or index == len(plants):
-                print(f'{index}/{len(plants)}: {counts}', flush=True)
-    print(f'Collection complete. Review {plan_path}. No database rows were changed.', flush=True)
+                    status = record['status']
+                    report_failed_match(record)
+                    counts[status] = counts.get(status, 0) + 1
+                    completed += 1
+                    if status == 'blocked':
+                        blocked = record['error']
+                    if writer:
+                        writer.add(record)
+                if writer and time.monotonic() - writer.last_flush >= 30:
+                    writer.flush()
+                if blocked:
+                    raise WebsiteBlocked(blocked)
+                if completed <= workers or completed % 25 == 0 or completed == len(plants):
+                    print(f'{completed}/{len(plants)}: {counts}', flush=True)
+                for _ in done:
+                    plant = next(remaining, None)
+                    if plant is not None:
+                        futures.add(pool.submit(collect_one, plant))
+            if writer:
+                writer.flush()
+        finally:
+            if hasattr(fetcher, 'stopped'):
+                fetcher.stopped.set()
+            for future in futures:
+                future.cancel()
+    message = 'Live updates committed to Supabase.' if live else 'No database rows were changed.'
+    print(f'Collection complete. Review {plan_path}. {message}', flush=True)
 
 
 def sql_literal(value: str) -> str:
@@ -450,7 +621,11 @@ def build_apply_sql(records: list[dict], run_id: str) -> str:
     ), audited as (
       insert into rootfind_private.mobot_changes(run_id, plant_id, source_url, old_row, new_row)
       select {run}, plant_id, source_url, old_row, new_row from updated returning plant_id
-    ) select count(*)::integer as updated_count from audited;
+    ) select count(*)::integer as updated_count,
+      (count(*) + (select count(*) from rootfind_private.mobot_changes a
+        join incoming s on s.plant_id = a.plant_id
+        where a.run_id = {run}))::integer as confirmed_count
+      from audited;
     """
 
 
@@ -486,17 +661,26 @@ def main(argv=None) -> int:
     parser.add_argument('--directory', type=Path, default=BACKEND / '.mobot')
     parser.add_argument('--project-ref', help='Defaults to the repo linked project')
     parser.add_argument('--limit', type=int, help='Collect only the first N current plants for a sample')
-    parser.add_argument('--delay', type=float, default=1.5, help='Seconds between source requests, minimum 1')
+    parser.add_argument('--delay', type=float, default=1.0, help='Seconds between all source request starts, minimum 1')
+    parser.add_argument('--workers', type=int, default=4, help='Concurrent collection workers (1–8), sharing one request limit')
     parser.add_argument('--retry', action='store_true', help='Reparse cached pages instead of skipping completed plan entries')
+    parser.add_argument('--apply-live', action='store_true', help='During collect, commit matched plants to Supabase in batches of 10 or every 30 seconds')
     args = parser.parse_args(argv)
     args.directory = args.directory.resolve()
     if args.limit is not None and args.limit < 1:
         parser.error('--limit must be positive')
+    if not 1 <= args.workers <= 8:
+        parser.error('--workers must be between 1 and 8')
+    if args.apply_live and args.command != 'collect':
+        parser.error('--apply-live is only supported with collect')
     db = Database(args.directory, args.project_ref)
     if args.command == 'collect':
         collect(db, args)
     elif args.command == 'prepare':
-        db.snapshot('before-schema')
+        snapshot = db.snapshot('before-schema')
+        if any(column.get('column_name') == 'sun' and column.get('udt_name') == '_sun_type'
+               for column in snapshot['schema']['columns']):
+            raise ValueError('Catalog schema is already prepared; skip MOBOT prepare to preserve migration 010 upserts')
         sql = (BACKEND / 'supabase/migrations/202610240008_mobot_enrichment.sql').read_text(encoding='utf-8')
         sql += '\n' + (BACKEND / 'supabase/migrations/202610240009_search_water_pagination.sql').read_text(encoding='utf-8')
         db.query(sql + '\nselect \'inches\' as measurement_unit;')
