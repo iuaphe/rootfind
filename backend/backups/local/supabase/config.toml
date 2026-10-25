@@ -1,0 +1,5 @@
+project_id = "rootfind-backup"
+[db]
+port = 15432
+shadow_port = 15430
+major_version = 17
