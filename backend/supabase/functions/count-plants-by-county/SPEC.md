@@ -1,17 +1,19 @@
 # count-plants-by-county
 
 Count all matching plants per recorded county in one database query. Requires
-`202610240010_count_plants_by_county.sql`, following migrations 008 and 009.
+`202610240014_count_plants_by_county.sql`, following migrations 008–013.
 
 ## Request
 
 `GET /functions/v1/count-plants-by-county`
 
-Accepts the name and trait parameters described in
+Accepts all taxonomy parameters plus the name and trait parameters described in
 [search-plants](../search-plants/SPEC.md#request): `search`, `lifeCycle`, `foliage`,
 `sun`, `water`, `isWoody`, `isTree`, `edible`, `thorns`, `minHeight`, `maxHeight`,
 `minWidth`, and `maxWidth`. All are optional. Empty filters count every linked
 plant. `page` and `pageSize` are rejected; counts always cover all matches.
+Taxonomy support requires `202610250001_taxonomy_search.sql` and uses the same
+case-insensitive exact matches as plant search. `county` is also rejected here.
 
 Search and count share query parsing, SQL validation, and matching predicates.
 Enum selections within a filter use OR; separate filters use AND. Name search

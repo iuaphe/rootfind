@@ -36,3 +36,6 @@ verify_jwt = false
 
 [functions.count-plants-by-county]
 verify_jwt = false
+
+[functions.suggest-plants]
+verify_jwt = false

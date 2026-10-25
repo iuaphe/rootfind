@@ -20,4 +20,4 @@ export function set_env(env) {
 	handle_issues(issues);
 }
 
-set_env({DATABASE_URL:"postgres://user:password@host:port/db-name"});
+set_env({});
